@@ -16,7 +16,7 @@ __pycache__/
 *.ogg
 
 # Project specific
-*_转写结果.txt
+*.txt
 temp_chunk_*.wav
 
 # System files
