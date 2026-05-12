@@ -24,6 +24,13 @@ def get_wav_duration(file_path):
         rate = wav_file.getframerate()
         return frames / float(rate)
 
+def format_time(seconds: float):
+    """将秒数格式化为 HH:MM:SS 的格式"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 class WhisperProgressLogger:
     """拦截 sys.stdout，通过解析 Whisper 打印的时间戳来更新全局进度条"""
     def __init__(self, pbar):
@@ -127,9 +134,17 @@ def transcribe_audio(input_path, model_name="small"):
                 if unprocessed > 0:
                     pbar.update(unprocessed)
                 
-                # 识别完一段，立刻将文字追加保存到文件中
+                # 识别完一段，立刻将文字带上时间戳追加保存到文件中
                 with open(output_path, "a", encoding="utf-8") as f:
-                    f.write(result["text"] + "\n")
+                    # ffmpeg 按 600 秒切片，我们加上这个基础偏移量来计算全局真实时间
+                    chunk_offset = idx * 600.0
+                    for segment in result.get("segments", []):
+                        start_time = chunk_offset + segment["start"]
+                        end_time = chunk_offset + segment["end"]
+                        text = segment["text"].strip()
+                        if text:
+                            # 输出格式: [00:05:21 - 00:05:25] 大家好，欢迎来到本期视频。
+                            f.write(f"[{format_time(start_time)} - {format_time(end_time)}] {text}\n")
                     
                 # 处理完一个片段就删掉一个临时文件
                 try:
