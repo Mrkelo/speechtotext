@@ -40,15 +40,24 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-### 3. (强烈推荐) 配置 GPU 专属 PyTorch
-如果你拥有 NVIDIA 独立显卡（如 Tesla P4 等），请务必卸载默认的纯 CPU 版本 PyTorch，并安装 CUDA 专属版本以获得数十倍的速度提升：
+### 3. (强烈推荐) 配置专属 GPU 加速环境
+
+**👉 如果你拥有 NVIDIA 显卡（如 Tesla P4 / RTX 3060 等）：**
+请务必卸载默认的纯 CPU 版本 PyTorch，并安装 CUDA 专属版本以获得数十倍的速度提升：
 
 ```powershell
 # 先卸载默认版本
 pip uninstall torch -y
 
-# 例如安装带 CUDA 11.8 支持的 GPU 版本
+# 安装带 CUDA 11.8 支持的 GPU 版本
 pip install torch --index-url https://download.pytorch.org/whl/cu118
+```
+
+**👉 如果你拥有 AMD 或 Intel 显卡（含核心显卡）：**
+本脚本已原生集成了 `DirectML` 自动识别底层逻辑！只需安装微软的插件包，即可调用 AMD/Intel 显卡满血运行：
+
+```powershell
+pip install torch-directml
 ```
 
 ## 🚀 使用方法

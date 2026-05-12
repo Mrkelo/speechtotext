@@ -60,12 +60,31 @@ def transcribe_audio(input_path, model_name="small"):
     使用 OpenAI Whisper 将音频或视频转换为文字。
     采用分段处理方式，防止长音频导致系统内存(RAM)溢出。
     """
-    device_name = "GPU (CUDA 加速)" if torch.cuda.is_available() else "纯 CPU (速度较慢)"
+    # 动态检测计算设备
+    device_name = "纯 CPU (速度较慢)"
+    device_type = "cpu"
+    use_fp16 = False
+    
+    if torch.cuda.is_available():
+        device_name = "NVIDIA GPU (CUDA 加速)"
+        device_type = "cuda"
+        use_fp16 = True
+    else:
+        try:
+            import torch_directml
+            if torch_directml.is_available():
+                device_name = "AMD/Intel GPU (DirectML 加速)"
+                device_type = torch_directml.device()
+                # DirectML 对部分半精度算子支持不佳，为保证稳定运行，使用 FP32
+                use_fp16 = False
+        except ImportError:
+            pass
+
     print(f"🚀 当前实际运行模式: {device_name}")
     print(f"正在加载 Whisper 模型 '{model_name}' (首次运行会自动下载模型，请耐心等待)...")
     try:
-        # 加载模型
-        model = whisper.load_model(model_name)
+        # 加载模型并将其分配到对应的计算设备上
+        model = whisper.load_model(model_name, device=device_type)
     except Exception as e:
         print(f"❌ 模型加载失败: {e}")
         print("提示：如果遇到网络问题，请检查网络连接或代理设置。")
@@ -103,7 +122,6 @@ def transcribe_audio(input_path, model_name="small"):
     print(f"✅ 音频预处理完毕！总时长约 {total_audio_duration/60:.1f} 分钟。开始智能识别...\n")
     
     start_time = time.time()
-    use_fp16 = torch.cuda.is_available()
     
     # 清空并创建最终的输出文件
     with open(output_path, "w", encoding="utf-8") as f:
