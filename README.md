@@ -38,7 +38,7 @@ pip install -r requirements.txt
 # 先卸载默认版本
 pip uninstall torch -y
 
-# 安装带 CUDA 11.8 支持的 GPU 版本
+# 例如安装带 CUDA 11.8 支持的 GPU 版本
 pip install torch --index-url https://download.pytorch.org/whl/cu118
 ```
 
