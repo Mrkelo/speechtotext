@@ -5,6 +5,10 @@ import time
 import torch
 import subprocess
 import glob
+import sys
+import re
+import wave
+from tqdm import tqdm
 
 # 将当前脚本所在目录临时添加到系统的 PATH 环境变量中
 # 将当前脚本所在目录及其子目录 ffmpeg/bin 临时添加到系统的 PATH 环境变量中
@@ -12,6 +16,37 @@ import glob
 script_dir = os.path.dirname(os.path.abspath(__file__))
 ffmpeg_bin_dir = os.path.join(script_dir, "ffmpeg", "bin")
 os.environ["PATH"] = script_dir + os.pathsep + ffmpeg_bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+def get_wav_duration(file_path):
+    """使用内置的 wave 模块获取 wav 文件的时长（秒）"""
+    with wave.open(file_path, 'r') as wav_file:
+        frames = wav_file.getnframes()
+        rate = wav_file.getframerate()
+        return frames / float(rate)
+
+class WhisperProgressLogger:
+    """拦截 sys.stdout，通过解析 Whisper 打印的时间戳来更新全局进度条"""
+    def __init__(self, pbar):
+        self.pbar = pbar
+        self.max_sec_seen = 0.0
+
+    def write(self, message):
+        # 匹配 Whisper 的输出格式，如: [00:00.000 --> 00:05.000] 或 [01:02:03.000 --> 01:02:08.000]
+        # 我们只提取箭号后面的“结束时间”
+        match = re.search(r'-->\s*(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})', message)
+        if match:
+            h, m, s, ms = match.groups()
+            h = int(h) if h else 0
+            current_sec = h * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+            
+            # 如果时间有推进，则计算差值并更新 tqdm
+            if current_sec > self.max_sec_seen:
+                update_val = current_sec - self.max_sec_seen
+                self.pbar.update(update_val)
+                self.max_sec_seen = current_sec
+
+    def flush(self):
+        pass
 
 def transcribe_audio(input_path, model_name="small"):
     """
@@ -29,7 +64,7 @@ def transcribe_audio(input_path, model_name="small"):
         print("提示：如果遇到网络问题，请检查网络连接或代理设置。")
         return
 
-    print(f"正在预处理音频：由于文件较长，正在自动安全分段以防内存不足...")
+    print(f"正在预处理音频：正在自动安全分段...")
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     output_path = f"{base_name}_转写结果.txt"
     
@@ -41,7 +76,6 @@ def transcribe_audio(input_path, model_name="small"):
             pass
 
     # 使用 ffmpeg 切割文件，每 600 秒 (10分钟) 一段
-    # 直接转换为 16kHz 单声道 wav，这也是 Whisper 底层需要的最佳格式，极大降低了内存占用
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-f", "segment", "-segment_time", "600",
@@ -57,7 +91,9 @@ def transcribe_audio(input_path, model_name="small"):
         print("❌ 音频分割失败，请检查输入文件是否有效或 ffmpeg 是否正常工作。")
         return
 
-    print(f"✅ 音频预处理完毕！已分割为 {len(chunk_files)} 个片段(每个约10分钟)，开始逐段智能识别...")
+    # 精确计算切片后的总音频时长
+    total_audio_duration = sum(get_wav_duration(f) for f in chunk_files)
+    print(f"✅ 音频预处理完毕！总时长约 {total_audio_duration/60:.1f} 分钟。开始智能识别...\n")
     
     start_time = time.time()
     use_fp16 = torch.cuda.is_available()
@@ -67,27 +103,48 @@ def transcribe_audio(input_path, model_name="small"):
         f.write("")
 
     try:
-        for idx, chunk_file in enumerate(chunk_files):
-            print(f"\n--- ⏳ 正在处理第 {idx+1}/{len(chunk_files)} 个片段 ---")
-            # verbose=True 会实时打印当前识别到的音频时间段和内容，起到进度条的作用
-            result = model.transcribe(chunk_file, language="zh", fp16=use_fp16, verbose=True)
-            
-            # 识别完一段，立刻将文字追加保存到文件中，防止意外中断导致数据丢失
-            with open(output_path, "a", encoding="utf-8") as f:
-                f.write(result["text"] + "\n")
+        # 自定义好看的中文进度条格式
+        pbar_format = "{l_bar}{bar}| 进度: {n:.1f}/{total:.1f} 秒音频 [已耗时: {elapsed}, 预计剩余: {remaining}]"
+        
+        with tqdm(total=total_audio_duration, unit="秒", bar_format=pbar_format) as pbar:
+            for idx, chunk_file in enumerate(chunk_files):
+                chunk_duration = get_wav_duration(chunk_file)
                 
-            # 处理完一个片段就删掉一个临时文件，为您节省硬盘空间和内存
-            try:
-                os.remove(chunk_file)
-            except:
-                pass
+                # 狸猫换太子：暂时把系统的打印输出重定向到我们的解析器，以拦截底层时间戳
+                logger = WhisperProgressLogger(pbar)
+                old_stdout = sys.stdout
+                sys.stdout = logger
+                
+                try:
+                    # verbose=True 会输出时间戳，刚好被上面的 logger 捕获并转换成进度条
+                    result = model.transcribe(chunk_file, language="zh", fp16=use_fp16, verbose=True)
+                finally:
+                    # 本段结束，把系统的打印输出还回去
+                    sys.stdout = old_stdout
+                
+                # 补齐误差（比如最后半秒钟 Whisper 没有打印出来）
+                unprocessed = chunk_duration - logger.max_sec_seen
+                if unprocessed > 0:
+                    pbar.update(unprocessed)
+                
+                # 识别完一段，立刻将文字追加保存到文件中
+                with open(output_path, "a", encoding="utf-8") as f:
+                    f.write(result["text"] + "\n")
+                    
+                # 处理完一个片段就删掉一个临时文件
+                try:
+                    os.remove(chunk_file)
+                except:
+                    pass
             
     except Exception as e:
+        # 万一报错了，确保控制台输出被恢复
+        sys.stdout = sys.__stdout__
         print(f"\n❌ 识别过程出错: {e}")
         return
 
     end_time = time.time()
-    print(f"\n🎉 识别大功告成！总耗时: {end_time - start_time:.2f} 秒")
+    print(f"\n🎉 识别大功告成！总处理耗时: {end_time - start_time:.2f} 秒")
     print(f"📄 所有的文字结果已合并并保存至: {output_path}")
 
 if __name__ == "__main__":
