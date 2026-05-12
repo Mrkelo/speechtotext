@@ -1,0 +1,30 @@
+# Environments
+venv/
+env/
+.env
+__pycache__/
+
+# Media files
+*.wav
+*.mp3
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.flac
+*.aac
+*.ogg
+
+# Project specific
+*_转写结果.txt
+temp_chunk_*.wav
+
+# System files
+.DS_Store
+Thumbs.db
+
+# ffmpeg
+ffmpeg/
+ffmpeg.exe
+ffprobe.exe
+ffplay.exe
