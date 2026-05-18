@@ -18,6 +18,7 @@ __pycache__/
 # Project specific
 *.txt
 temp_chunk_*.wav
+cache/
 
 # System files
 .DS_Store

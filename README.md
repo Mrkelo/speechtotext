@@ -1,92 +1,183 @@
-# Whisper 语音/视频转文字工具 (Speech-to-Text)
+﻿# Speech-to-Text
 
-这是一个基于 [OpenAI Whisper](https://github.com/openai/whisper) 开发的自动化音视频转文字脚本。
-旨在提供**完全免费**、**高质量中文识别**、并且**防内存溢出(OOM)**的本地化转写方案。
+这是一个本地音视频转文字脚本，当前支持：
 
-## 🎯 典型应用场景（摸鱼神器）
+- 本地音频 / 视频文件转写
+- 直接传入 B 站视频链接转写
+- B 站媒体缓存复用
+- NVIDIA `CUDA`
+- AMD 官方 `ROCm + PyTorch`
+- Intel `OpenVINO`
+- Hugging Face 镜像源与超时控制
 
-本工具最核心的实战用途：
-**快速搞定学习心得 / 培训观后感 / 会议纪要！**
-1. **自动提取**：使用本脚本，将老师布置的枯燥讲座视频、或公司冗长的培训视频，一键转换为纯文本描述。
-2. **AI 辅助**：将提取出的几十万字文本直接“喂”给大语言模型（如 ChatGPT、Kimi、Claude 等）。
-3. **秒出心得**：让大模型根据文本内容自动帮你生成一份高质量的“学习心得”或“观后感”，完美应付交差任务！
+## 安装
 
-## 🌟 核心特性
+### 1. 准备 FFmpeg
 
-- **智能切片防爆内存**：自动使用 `ffmpeg` 将超长音视频无损切分为 10 分钟小段进行处理。哪怕是长达几小时的视频，在 4GB 甚至更低内存/显存的电脑（如 vGPU 实例）上也能稳定运行，拒绝崩溃。
-- **实时保存防丢失**：处理完每一个小片段后会自动追加写入到 txt 文件中。即使中途断电关机，已识别的文字也会被安全保存。
-- **GPU (CUDA) 自动加速**：代码会自动检测 NVIDIA 显卡。如果检测到支持 CUDA 的环境，将自动开启 `fp16` 半精度推理，速度飙升 10 倍以上。
-- **精准时间戳（类SRT字幕格式）**：提取出的纯文本会自动带有 `[HH:MM:SS - HH:MM:SS]` 格式的时间戳。无论是给人类阅读还是发给大模型（LLM）总结归纳，都能提供完美的上下文时间轴线索，防止大段文本导致的逻辑混乱。
-- **实时进度条**：拥有超酷的百分比进度条，实时显示当前已处理的音频秒数、已耗时以及精准的预估剩余时间，让你对进度一目了然。
+把 `ffmpeg.exe` 放到项目目录下的 `ffmpeg/bin/` 里，或者确保系统 `PATH` 里已经有 `ffmpeg`。
 
-## 🛠️ 安装说明
-
-### 1. 安装 FFmpeg (核心依赖)
-Whisper 的底层音频解码需要依赖 FFmpeg。
-请下载 Windows 版本的 FFmpeg，并将其提取出来的 `ffmpeg.exe` 放置在与脚本同目录下的 `ffmpeg/bin/` 文件夹中（或直接放置在同目录下）。脚本启动时会自动寻找它，**无需手动配置系统环境变量**。
-
-### 2. 配置 Python 环境
-
-建议使用 Python 虚拟环境以隔离依赖：
+### 2. 安装 Python 依赖
 
 ```powershell
-# 1. 创建虚拟环境
 python -m venv venv
-
-# 2. 激活虚拟环境 (Windows)
 .\venv\Scripts\activate
-
-# 3. 安装依赖包
 pip install -r requirements.txt
 ```
 
-### 3. (强烈推荐) 配置专属 GPU 加速环境
+## 基本用法
 
-**👉 如果你拥有 NVIDIA 显卡（如 Tesla P4 / RTX 3060 等）：**
-请务必卸载默认的纯 CPU 版本 PyTorch，并安装 CUDA 专属版本以获得数十倍的速度提升：
-
-```powershell
-# 先卸载默认版本
-pip uninstall torch -y
-
-# 安装带 CUDA 11.8 支持的 GPU 版本
-pip install torch --index-url https://download.pytorch.org/whl/cu118
-```
-
-**👉 如果你拥有 AMD 或 Intel 显卡（含核心显卡）：**
-本脚本已原生集成了 `DirectML` 自动识别底层逻辑！只需安装微软的插件包，即可调用 AMD/Intel 显卡满血运行：
-
-```powershell
-pip install torch-directml
-```
-
-## 🚀 使用方法
-
-将需要转换的音频（如 `.wav`, `.mp3`）或视频（如 `.mp4`, `.mkv`）放入文件夹，打开终端并激活虚拟环境，然后运行：
+### 本地文件
 
 ```powershell
 python speech_to_text.py "你的音视频文件路径"
 ```
 
-**进阶模型选择：**
-脚本默认使用 `small` 模型（占用显存约 2GB，兼顾速度与质量）。如果你希望获得极致的中文识别质量，可以通过 `--model` 参数切换为 `medium`（推荐，约 5GB 显存）或 `large` 模型：
+### B 站链接
 
 ```powershell
-python speech_to_text.py "你的音视频文件路径" --model medium
+python speech_to_text.py "https://www.bilibili.com/video/BVxxxxxxxxxx"
 ```
 
-*注：首次使用某个特定尺寸的模型时，脚本会在后台自动从官网下载模型文件，请耐心等待。*
+如果视频需要登录态：
 
-> **💡 真实硬件实测经验 (Tesla P4 4GB vGPU)**
-> 经过实测，默认的 `small` 模型在仅有 4GB 显存的 Tesla P4 vGPU 环境下运行极其流畅，没有发生内存溢出。
-> **精度提醒**：`small` 模型的中文精度处于“仅为可用”级别，比较容易出现同音字识别错误的情况（例如会将专业的“竞品”识别成“进品”）。如果后续需要极高准确率的专业文稿，且硬件允许（显存 > 5GB），强烈建议使用 `--model medium`。
+```powershell
+python speech_to_text.py "https://www.bilibili.com/video/BVxxxxxxxxxx" --cookies ".\cookies.txt"
+```
 
-## 📄 结果输出
-转换完成后，脚本会自动在原音视频同目录下生成一个以 `_转写结果.txt` 结尾的文本文件。
+## 后端说明
 
-**输出内容示例（完美适配大模型解析）：**
+### NVIDIA
+
+```powershell
+python speech_to_text.py "你的音视频文件路径" --backend cuda
+```
+
+### AMD
+
+脚本不再走 `DirectML`。AMD 机器优先建议使用官方 `ROCm + PyTorch`：
+
+```powershell
+python speech_to_text.py "你的音视频文件路径" --backend rocm
+```
+
+如果当前 Windows / Linux 机器没有可用的官方 ROCm 环境，建议直接回退 CPU：
+
+```powershell
+python speech_to_text.py "你的音视频文件路径" --backend cpu
+```
+
+### Intel
+
+脚本不再走 `DirectML`。Intel 机器优先建议使用 `OpenVINO`：
+
+```powershell
+python speech_to_text.py "你的音视频文件路径" --backend openvino --openvino-device GPU
+```
+
+支持的 OpenVINO 设备参数：
+
+- `AUTO`
+- `CPU`
+- `GPU`
+- `NPU`
+
+当前 OpenVINO 路径支持的模型：
+
+- `tiny`
+- `base`
+- `small`
+- `medium`
+- `large`
+
+`turbo` 不走 OpenVINO 官方预转换模型；如果你要用 `turbo`，请改用 `--backend cpu / cuda / rocm`。
+
+## 大陆网络下的 Hugging Face 下载
+
+如果你在首次下载 OpenVINO Whisper 模型时遇到 `ConnectTimeout`、`WinError 10060` 或 Hugging Face 连接超时，现在脚本支持：
+
+- `--hf-endpoint`：指定 Hugging Face Hub 镜像
+- `--hf-timeout`：拉长 metadata / download 超时
+- 自动回退：如果没显式指定 endpoint，会先试官方源，再试 `https://hf-mirror.com`
+
+推荐命令：
+
+```powershell
+python speech_to_text.py "你的音视频文件路径" --backend openvino --openvino-device GPU --hf-endpoint "https://hf-mirror.com" --hf-timeout 60
+```
+
+也可以长期设置环境变量：
+
+```powershell
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+$env:HF_HUB_ETAG_TIMEOUT = "60"
+$env:HF_HUB_DOWNLOAD_TIMEOUT = "60"
+python speech_to_text.py "你的音视频文件路径" --backend openvino --openvino-device GPU
+```
+
+## 缓存目录
+
+### B 站媒体缓存
+
+首次下载成功后，脚本会把媒体缓存到：
+
 ```text
-[00:00:00 - 00:00:04] 大家好，欢迎来到本期实战课堂。
-[00:00:04 - 00:00:08] 今天我们要讲解的是如何用 AI 快速分析竞品。
-[00:00:08 - 00:00:15] 很多同学在拿到竞品数据后，往往不知道从何下手...
+cache/bilibili/
+```
+
+同一个 B 站链接再次转写时，会优先复用这里的本地媒体文件，不会重复下载。
+
+### OpenVINO 模型缓存
+
+OpenVINO Whisper 模型会缓存到：
+
+```text
+cache/openvino/
+```
+
+如果目录下已经有完整模型文件，脚本会直接复用缓存，不会重新下载。
+
+## `cookies.txt` 获取方式
+
+脚本的 `--cookies` 参数需要的是 Netscape / Mozilla 格式的 `cookies.txt` 文件。
+
+推荐直接用 `yt-dlp` 从浏览器导出：
+
+```powershell
+yt-dlp --cookies-from-browser chrome --cookies cookies.txt "https://www.bilibili.com/video/BVxxxxxxxxxx"
+```
+
+也可以用：
+
+- Chrome / Edge：`Get cookies.txt LOCALLY`
+- Firefox：`cookies.txt`
+
+## `yt-dlp` 能不能获取高清版视频
+
+可以，但当前这个脚本的目标是转文字，不是保存高清视频文件。
+
+- `yt-dlp` 本身可以下载最佳可用画质
+- 当前脚本代码里明确使用的是 `bestaudio/best`
+- 也就是说，脚本只会下载最佳音频流用于转写，不会额外保存高清视频
+
+如果你只是想查看某个 B 站视频有哪些格式可下：
+
+```powershell
+yt-dlp -F "https://www.bilibili.com/video/BVxxxxxxxxxx"
+```
+
+如果你想手工下载最佳视频 + 音频并合并：
+
+```powershell
+yt-dlp -f "bv+ba/b" "https://www.bilibili.com/video/BVxxxxxxxxxx"
+```
+
+## 输出位置
+
+- 本地文件输入：输出到原文件所在目录
+- B 站链接输入：输出到你运行命令时所在的当前目录
+
+输出文件名格式：
+
+```text
+<原文件名或视频标题>_转写结果.txt
 ```

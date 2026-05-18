@@ -1,194 +1,768 @@
-import whisper
-import os
-import argparse
-import time
-import torch
-import subprocess
+﻿import argparse
 import glob
-import sys
+import hashlib
+import json
+import os
+import platform
 import re
+import subprocess
+import sys
+import time
 import wave
+from urllib.parse import parse_qs, urlparse
+
+import torch
+import whisper
 from tqdm import tqdm
 
-# 将当前脚本所在目录临时添加到系统的 PATH 环境变量中
-# 将当前脚本所在目录及其子目录 ffmpeg/bin 临时添加到系统的 PATH 环境变量中
-# 这样哪怕 ffmpeg 没有加到系统环境变量，只要放在本脚本同目录下，Whisper 也能正常调用它
-script_dir = os.path.dirname(os.path.abspath(__file__))
-ffmpeg_bin_dir = os.path.join(script_dir, "ffmpeg", "bin")
-os.environ["PATH"] = script_dir + os.pathsep + ffmpeg_bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FFMPEG_BIN_DIR = os.path.join(SCRIPT_DIR, "ffmpeg", "bin")
+os.environ["PATH"] = SCRIPT_DIR + os.pathsep + FFMPEG_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
+
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+BILIBILI_CACHE_ROOT = os.path.join(SCRIPT_DIR, "cache", "bilibili")
+OPENVINO_CACHE_ROOT = os.path.join(SCRIPT_DIR, "cache", "openvino")
+
+OPENVINO_WHISPER_MODELS = {
+    "tiny": "OpenVINO/whisper-tiny-fp16-ov",
+    "base": "OpenVINO/whisper-base-fp16-ov",
+    "small": "OpenVINO/whisper-small-fp16-ov",
+    "medium": "OpenVINO/whisper-medium-fp16-ov",
+    "large": "OpenVINO/whisper-large-v3-int4-ov",
+}
+
+OPENVINO_REQUIRED_FILES = [
+    "config.json",
+    "generation_config.json",
+    "openvino_encoder_model.bin",
+    "openvino_encoder_model.xml",
+    "openvino_decoder_model.bin",
+    "openvino_decoder_model.xml",
+    "openvino_tokenizer.bin",
+    "openvino_tokenizer.xml",
+    "openvino_detokenizer.bin",
+    "openvino_detokenizer.xml",
+    "preprocessor_config.json",
+]
+
+OPENVINO_LANGUAGE_TOKEN = "<|zh|>"
+DEFAULT_HF_ENDPOINT = "https://huggingface.co"
+DEFAULT_HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
+DEFAULT_HF_ETAG_TIMEOUT = 30
+DEFAULT_HF_DOWNLOAD_TIMEOUT = 120
+
 
 def get_wav_duration(file_path):
-    """使用内置的 wave 模块获取 wav 文件的时长（秒）"""
-    with wave.open(file_path, 'r') as wav_file:
+    with wave.open(file_path, "r") as wav_file:
         frames = wav_file.getnframes()
         rate = wav_file.getframerate()
         return frames / float(rate)
 
-def format_time(seconds: float):
-    """将秒数格式化为 HH:MM:SS 的格式"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def format_time(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
 
 class WhisperProgressLogger:
-    """拦截 sys.stdout，通过解析 Whisper 打印的时间戳来更新全局进度条"""
     def __init__(self, pbar):
         self.pbar = pbar
         self.max_sec_seen = 0.0
 
     def write(self, message):
-        # 匹配 Whisper 的输出格式，如: [00:00.000 --> 00:05.000] 或 [01:02:03.000 --> 01:02:08.000]
-        # 我们只提取箭号后面的“结束时间”
         match = re.search(r'-->\s*(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})', message)
-        if match:
-            h, m, s, ms = match.groups()
-            h = int(h) if h else 0
-            current_sec = h * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
-            
-            # 如果时间有推进，则计算差值并更新 tqdm
-            if current_sec > self.max_sec_seen:
-                update_val = current_sec - self.max_sec_seen
-                self.pbar.update(update_val)
-                self.max_sec_seen = current_sec
+        if not match:
+            return
+
+        hours, minutes, secs, millis = match.groups()
+        hours = int(hours) if hours else 0
+        current_sec = hours * 3600 + int(minutes) * 60 + int(secs) + int(millis) / 1000.0
+
+        if current_sec > self.max_sec_seen:
+            self.pbar.update(current_sec - self.max_sec_seen)
+            self.max_sec_seen = current_sec
 
     def flush(self):
         pass
 
-def transcribe_audio(input_path, model_name="small"):
-    """
-    使用 OpenAI Whisper 将音频或视频转换为文字。
-    采用分段处理方式，防止长音频导致系统内存(RAM)溢出。
-    """
-    # 动态检测计算设备
-    device_name = "纯 CPU (速度较慢)"
-    device_type = "cpu"
-    use_fp16 = False
-    
-    if torch.cuda.is_available():
-        device_name = "NVIDIA GPU (CUDA 加速)"
-        device_type = "cuda"
-        use_fp16 = True
-    else:
+
+def sanitize_filename(name):
+    sanitized = INVALID_FILENAME_CHARS.sub("_", name).strip().rstrip(".")
+    return sanitized or "bilibili_video"
+
+
+def is_url(value):
+    parsed = urlparse(value)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def is_bilibili_url(value):
+    hostname = urlparse(value).netloc.lower().split("@")[-1].split(":")[0]
+    return hostname == "b23.tv" or hostname == "bilibili.com" or hostname.endswith(".bilibili.com")
+
+
+def detect_host_vendor():
+    hints = " ".join(
+        filter(
+            None,
+            [
+                os.environ.get("PROCESSOR_IDENTIFIER"),
+                platform.processor(),
+                platform.machine(),
+            ],
+        )
+    ).lower()
+
+    if "intel" in hints:
+        return "intel"
+    if "amd" in hints or "ryzen" in hints:
+        return "amd"
+    return "unknown"
+
+
+def is_rocm_available():
+    return torch.cuda.is_available() and bool(getattr(torch.version, "hip", None))
+
+
+def is_cuda_available():
+    return torch.cuda.is_available() and not is_rocm_available()
+
+
+def can_use_openvino():
+    try:
+        import huggingface_hub  # noqa: F401
+        import openvino_genai  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def normalize_hf_endpoint(endpoint):
+    if not endpoint:
+        return None
+    return endpoint.strip().rstrip("/")
+
+
+def get_effective_hf_endpoint(cli_endpoint=None):
+    return normalize_hf_endpoint(cli_endpoint or os.environ.get("HF_ENDPOINT"))
+
+
+def parse_positive_int(raw_value):
+    if raw_value in (None, ""):
+        return None
+
+    try:
+        parsed_value = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+    return parsed_value if parsed_value > 0 else None
+
+
+def get_effective_hf_timeouts(cli_timeout=None):
+    cli_value = parse_positive_int(cli_timeout)
+    if cli_value is not None:
+        return cli_value, cli_value
+
+    env_etag_timeout = parse_positive_int(os.environ.get("HF_HUB_ETAG_TIMEOUT"))
+    env_download_timeout = parse_positive_int(os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT"))
+
+    return (
+        env_etag_timeout or DEFAULT_HF_ETAG_TIMEOUT,
+        env_download_timeout or DEFAULT_HF_DOWNLOAD_TIMEOUT,
+    )
+
+
+def build_hf_endpoint_candidates(preferred_endpoint=None):
+    candidates = []
+    for endpoint in [preferred_endpoint, DEFAULT_HF_ENDPOINT, DEFAULT_HF_MIRROR_ENDPOINT]:
+        normalized = normalize_hf_endpoint(endpoint)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def format_hf_endpoint_label(endpoint):
+    if endpoint == DEFAULT_HF_ENDPOINT:
+        return "Hugging Face 官方源"
+    if endpoint == DEFAULT_HF_MIRROR_ENDPOINT:
+        return "中国大陆镜像 hf-mirror.com"
+    return endpoint
+
+
+def is_likely_network_error(exc):
+    error_text = str(exc).lower()
+    network_markers = [
+        "connecttimeout",
+        "readtimeout",
+        "timed out",
+        "winerror 10060",
+        "max retries exceeded",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "failed to establish a new connection",
+        "connection aborted",
+        "connection reset",
+        "proxyerror",
+    ]
+    return any(marker in error_text for marker in network_markers)
+
+
+def format_openvino_download_failure(model_repo, model_dir, endpoint_errors, etag_timeout, download_timeout):
+    attempted = " -> ".join(format_hf_endpoint_label(endpoint) for endpoint, _ in endpoint_errors)
+    lines = [
+        f"OpenVINO Whisper 模型下载失败: {model_repo}",
+        f"缓存目录: {model_dir}",
+        f"已尝试地址: {attempted}",
+        f"当前超时设置: metadata={etag_timeout}s, download={download_timeout}s",
+    ]
+
+    for endpoint, exc in endpoint_errors:
+        lines.append(f"- {format_hf_endpoint_label(endpoint)}: {exc}")
+
+    lines.extend(
+        [
+            "可尝试：",
+            "1. 在中国大陆网络下加 `--hf-endpoint https://hf-mirror.com`。",
+            "2. 慢网环境下加 `--hf-timeout 60` 或更大。",
+            "3. 如果之前已下载过完整模型，确认 `cache/openvino/<model>/` 下的 .bin / .xml 文件是否齐全。",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def get_execution_backend(preferred_backend, model_name):
+    if preferred_backend == "cuda":
+        if not is_cuda_available():
+            raise RuntimeError("当前环境没有可用的 NVIDIA CUDA。")
+        return "cuda", "NVIDIA GPU (CUDA 加速)"
+
+    if preferred_backend == "rocm":
+        if not is_rocm_available():
+            raise RuntimeError("当前环境没有检测到 AMD ROCm PyTorch。")
+        return "rocm", "AMD GPU (ROCm 加速)"
+
+    if preferred_backend == "openvino":
+        if not can_use_openvino():
+            raise RuntimeError("当前环境缺少 OpenVINO 依赖，请先执行 `pip install -r requirements.txt`。")
+        if model_name not in OPENVINO_WHISPER_MODELS:
+            supported = ", ".join(OPENVINO_WHISPER_MODELS.keys())
+            raise RuntimeError(f"OpenVINO 后端当前仅支持 {supported}，收到的是 '{model_name}'。")
+        return "openvino", "Intel OpenVINO 后端"
+
+    if preferred_backend == "cpu":
+        return "cpu", "纯 CPU"
+
+    if is_rocm_available():
+        return "rocm", "AMD GPU (ROCm 加速)"
+    if is_cuda_available():
+        return "cuda", "NVIDIA GPU (CUDA 加速)"
+    if detect_host_vendor() == "intel" and can_use_openvino() and model_name in OPENVINO_WHISPER_MODELS:
+        return "openvino", "Intel OpenVINO 后端"
+    return "cpu", "纯 CPU"
+
+
+def get_openvino_model_cache_dir(model_name):
+    return os.path.join(OPENVINO_CACHE_ROOT, model_name)
+
+
+def is_openvino_model_ready(model_dir):
+    return all(os.path.exists(os.path.join(model_dir, file_name)) for file_name in OPENVINO_REQUIRED_FILES)
+
+
+def ensure_openvino_model(model_name, hf_endpoint=None, hf_timeout=None):
+    if model_name not in OPENVINO_WHISPER_MODELS:
+        supported = ", ".join(OPENVINO_WHISPER_MODELS.keys())
+        raise RuntimeError(f"OpenVINO 后端当前仅支持 {supported}，收到的是 '{model_name}'。")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 huggingface_hub，请先执行 `pip install -r requirements.txt`。") from exc
+
+    model_dir = get_openvino_model_cache_dir(model_name)
+    if is_openvino_model_ready(model_dir):
+        return model_dir
+
+    os.makedirs(model_dir, exist_ok=True)
+    model_repo = OPENVINO_WHISPER_MODELS[model_name]
+    endpoint_candidates = build_hf_endpoint_candidates(hf_endpoint)
+    etag_timeout, download_timeout = get_effective_hf_timeouts(hf_timeout)
+
+    os.environ["HF_HUB_ETAG_TIMEOUT"] = str(etag_timeout)
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(download_timeout)
+
+    print(f"正在下载 OpenVINO Whisper 模型: {model_repo}")
+    print(f"metadata 超时: {etag_timeout}s, download 超时: {download_timeout}s")
+
+    endpoint_errors = []
+    for endpoint in endpoint_candidates:
+        print(f"正在尝试模型下载源: {format_hf_endpoint_label(endpoint)}")
         try:
-            import torch_directml
-            if torch_directml.is_available():
-                device_name = "AMD/Intel GPU (DirectML 加速)"
-                device_type = torch_directml.device()
-                # DirectML 对部分半精度算子支持不佳，为保证稳定运行，使用 FP32
-                use_fp16 = False
-        except ImportError:
+            snapshot_download(
+                repo_id=model_repo,
+                local_dir=model_dir,
+                endpoint=endpoint,
+                etag_timeout=etag_timeout,
+                max_workers=4,
+            )
+            break
+        except Exception as exc:
+            endpoint_errors.append((endpoint, exc))
+            if is_openvino_model_ready(model_dir):
+                print("检测到完整本地模型缓存，继续使用本地缓存。")
+                return model_dir
+
+            if is_likely_network_error(exc):
+                print(f"当前下载源连接超时或失败，准备尝试下一个地址: {exc}")
+            else:
+                print(f"当前下载源失败，准备尝试下一个地址: {exc}")
+    else:
+        raise RuntimeError(
+            format_openvino_download_failure(
+                model_repo,
+                model_dir,
+                endpoint_errors,
+                etag_timeout,
+                download_timeout,
+            )
+        )
+
+    if not is_openvino_model_ready(model_dir):
+        raise RuntimeError("OpenVINO Whisper 模型下载完成，但缓存目录中的关键文件仍不完整。")
+
+    print(f"✅ OpenVINO Whisper 模型已缓存到: {model_dir}")
+    return model_dir
+
+
+def get_openvino_device_candidates(preferred_device):
+    preferred_device = preferred_device.upper()
+    if preferred_device != "AUTO":
+        return [preferred_device]
+
+    if detect_host_vendor() == "intel":
+        return ["GPU", "CPU"]
+    return ["CPU"]
+
+
+def load_openvino_pipeline(model_name, preferred_device, hf_endpoint=None, hf_timeout=None):
+    try:
+        import openvino_genai as ov_genai
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 openvino-genai，请先执行 `pip install -r requirements.txt`。") from exc
+
+    model_dir = ensure_openvino_model(model_name, hf_endpoint=hf_endpoint, hf_timeout=hf_timeout)
+    last_error = None
+
+    for device_name in get_openvino_device_candidates(preferred_device):
+        try:
+            pipeline = ov_genai.WhisperPipeline(model_dir, device_name)
+            return pipeline, device_name
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"OpenVINO 后端初始化失败: {last_error}")
+
+
+def load_whisper_model(model_name, backend_kind):
+    device_name = "cuda" if backend_kind in {"cuda", "rocm"} else "cpu"
+    return whisper.load_model(model_name, device=device_name)
+
+
+def load_wav_samples_for_openvino(file_path):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 numpy，请先执行 `pip install -r requirements.txt`。") from exc
+
+    with wave.open(file_path, "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if channels != 1 or sample_width != 2 or sample_rate != 16000:
+        raise RuntimeError("OpenVINO 输入 wav 必须是 16kHz / 16-bit / 单声道 PCM。")
+
+    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def normalize_bilibili_page(page_value):
+    if not page_value:
+        return None
+
+    try:
+        page_number = int(page_value)
+        return None if page_number <= 1 else str(page_number)
+    except (TypeError, ValueError):
+        return str(page_value)
+
+
+def get_bilibili_cache_key(url):
+    parsed = urlparse(url)
+    hostname = parsed.netloc.lower().split("@")[-1].split(":")[0]
+    path = parsed.path.rstrip("/")
+    query = parse_qs(parsed.query)
+
+    video_match = re.search(r"/video/((?:BV|av)[A-Za-z0-9]+)", path, re.IGNORECASE)
+    if video_match:
+        video_id = video_match.group(1)
+        page = normalize_bilibili_page(query.get("p", [None])[0])
+        return sanitize_filename(f"{video_id}_p{page}" if page else video_id)
+
+    if hostname == "b23.tv":
+        short_code = path.strip("/") or "index"
+        return sanitize_filename(f"b23_{short_code}")
+
+    normalized_url = f"{hostname}{path}"
+    page = normalize_bilibili_page(query.get("p", [None])[0])
+    if page:
+        normalized_url = f"{normalized_url}?p={page}"
+
+    digest = hashlib.sha1(normalized_url.encode("utf-8")).hexdigest()[:16]
+    return f"bilibili_{digest}"
+
+
+def get_bilibili_cache_paths(url):
+    cache_dir = os.path.join(BILIBILI_CACHE_ROOT, get_bilibili_cache_key(url))
+    metadata_path = os.path.join(cache_dir, "metadata.json")
+    return cache_dir, metadata_path
+
+
+def find_cached_media_file(cache_dir):
+    for candidate in sorted(glob.glob(os.path.join(cache_dir, "source.*"))):
+        if not os.path.isfile(candidate):
+            continue
+
+        extension = os.path.splitext(candidate)[1].lower()
+        if extension in {".json", ".part", ".temp", ".ytdl"}:
+            continue
+
+        return candidate
+
+    return None
+
+
+def load_cached_bilibili_media(url):
+    cache_dir, metadata_path = get_bilibili_cache_paths(url)
+    media_path = find_cached_media_file(cache_dir)
+    if not media_path:
+        return None, None
+
+    metadata = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+
+    output_stem = sanitize_filename(
+        metadata.get("output_stem")
+        or metadata.get("title")
+        or os.path.splitext(os.path.basename(media_path))[0]
+    )
+    return media_path, output_stem
+
+
+def write_bilibili_cache_metadata(metadata_path, source_url, info, output_stem):
+    metadata = {
+        "source_url": source_url,
+        "resolved_url": info.get("webpage_url") or source_url,
+        "video_id": info.get("id"),
+        "title": info.get("title"),
+        "output_stem": output_stem,
+        "cached_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+
+
+def download_bilibili_media(url, cookies_path=None):
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 yt-dlp，请先执行 `pip install -r requirements.txt`。") from exc
+
+    if cookies_path and not os.path.exists(cookies_path):
+        raise FileNotFoundError(f"找不到 cookies 文件: '{cookies_path}'")
+
+    cached_media_path, cached_output_stem = load_cached_bilibili_media(url)
+    if cached_media_path:
+        print(f"检测到本地缓存，跳过下载: {cached_media_path}")
+        return cached_media_path, cached_output_stem
+
+    cache_dir, metadata_path = get_bilibili_cache_paths(url)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    print("检测到 B 站链接，正在下载源视频/音频...")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(cache_dir, "source.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    if cookies_path:
+        ydl_opts["cookiefile"] = cookies_path
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as exc:
+        raise RuntimeError(f"B 站视频下载失败: {exc}") from exc
+
+    downloaded_media_path = find_cached_media_file(cache_dir)
+    if not downloaded_media_path:
+        raise RuntimeError("B 站视频下载完成，但没有找到可转写的媒体文件。")
+
+    title = info.get("title") or info.get("id") or "bilibili_video"
+    output_stem = sanitize_filename(title)
+    write_bilibili_cache_metadata(metadata_path, url, info, output_stem)
+
+    print(f"✅ B 站内容下载完成，已缓存到: {cache_dir}")
+    return downloaded_media_path, output_stem
+
+
+def resolve_input_source(input_value, cookies_path=None):
+    if is_url(input_value):
+        if not is_bilibili_url(input_value):
+            raise ValueError("当前仅支持直接传入 B 站视频链接（bilibili.com 或 b23.tv）。")
+
+        media_path, output_stem = download_bilibili_media(input_value, cookies_path)
+        return media_path, output_stem, os.getcwd()
+
+    if not os.path.exists(input_value):
+        raise FileNotFoundError(f"找不到文件: '{input_value}'")
+
+    output_stem = os.path.splitext(os.path.basename(input_value))[0]
+    output_dir = os.path.dirname(os.path.abspath(input_value))
+    return input_value, output_stem, output_dir
+
+
+def cleanup_temp_chunks():
+    for chunk_file in glob.glob("temp_chunk_*.wav"):
+        try:
+            os.remove(chunk_file)
+        except OSError:
             pass
 
-    print(f"🚀 当前实际运行模式: {device_name}")
+
+def transcribe_audio(
+    input_path,
+    model_name="small",
+    output_stem=None,
+    output_dir=None,
+    backend="auto",
+    openvino_device="AUTO",
+    hf_endpoint=None,
+    hf_timeout=None,
+):
+    backend_kind, backend_name = get_execution_backend(backend, model_name)
+    use_fp16 = backend_kind in {"cuda", "rocm"}
+
+    print(f"🚀 当前实际运行模式: {backend_name}")
     print(f"正在加载 Whisper 模型 '{model_name}' (首次运行会自动下载模型，请耐心等待)...")
+
     try:
-        # 加载模型并将其分配到对应的计算设备上
-        model = whisper.load_model(model_name, device=device_type)
-    except Exception as e:
-        print(f"❌ 模型加载失败: {e}")
-        print("提示：如果遇到网络问题，请检查网络连接或代理设置。")
+        model = None
+        ov_pipeline = None
+        ov_device_name = None
+
+        if backend_kind == "openvino":
+            ov_pipeline, ov_device_name = load_openvino_pipeline(
+                model_name,
+                openvino_device,
+                hf_endpoint=hf_endpoint,
+                hf_timeout=hf_timeout,
+            )
+            print(f"✅ OpenVINO 设备初始化成功: {ov_device_name}")
+        else:
+            model = load_whisper_model(model_name, backend_kind)
+    except Exception as exc:
+        print(f"❌ 模型加载失败: {exc}")
+        if backend_kind == "openvino":
+            print("提示：请确认已安装 openvino / openvino-genai / huggingface_hub。")
+            print("提示：如果是大陆网络，建议加 `--hf-endpoint https://hf-mirror.com`。")
+            print("提示：如果是慢网，建议加 `--hf-timeout 60`。")
+        elif backend_kind == "rocm":
+            print("提示：请确认当前安装的是 AMD 官方 ROCm PyTorch，并且硬件在 ROCm 支持矩阵内。")
+        else:
+            print("提示：如果遇到网络问题，请检查网络连接或代理设置。")
         return
 
-    print(f"正在预处理音频：正在自动安全分段...")
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    output_path = f"{base_name}_转写结果.txt"
-    
-    # 先清理可能残留的历史临时文件
-    for f in glob.glob("temp_chunk_*.wav"):
-        try:
-            os.remove(f)
-        except:
-            pass
+    print("正在预处理音频：自动安全分段...")
+    base_name = sanitize_filename(output_stem or os.path.splitext(os.path.basename(input_path))[0])
+    output_directory = output_dir or os.getcwd()
+    output_path = os.path.join(output_directory, f"{base_name}_转写结果.txt")
 
-    # 使用 ffmpeg 切割文件，每 600 秒 (10分钟) 一段
+    cleanup_temp_chunks()
+
     ffmpeg_cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-f", "segment", "-segment_time", "600",
-        "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        "temp_chunk_%03d.wav"
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-f",
+        "segment",
+        "-segment_time",
+        "600",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "temp_chunk_%03d.wav",
     ]
-    
-    # 隐藏 ffmpeg 的大量输出
-    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
+
+    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
     chunk_files = sorted(glob.glob("temp_chunk_*.wav"))
     if not chunk_files:
         print("❌ 音频分割失败，请检查输入文件是否有效或 ffmpeg 是否正常工作。")
         return
 
-    # 精确计算切片后的总音频时长
-    total_audio_duration = sum(get_wav_duration(f) for f in chunk_files)
-    print(f"✅ 音频预处理完毕！总时长约 {total_audio_duration/60:.1f} 分钟。开始智能识别...\n")
-    
-    start_time = time.time()
-    
-    # 清空并创建最终的输出文件
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("")
+    total_audio_duration = sum(get_wav_duration(chunk_file) for chunk_file in chunk_files)
+    print(f"✅ 音频预处理完毕，总时长约 {total_audio_duration / 60:.1f} 分钟。开始智能识别...\n")
+
+    process_start_time = time.time()
+
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        output_file.write("")
 
     try:
-        # 自定义好看的中文进度条格式
         pbar_format = "{l_bar}{bar}| 进度: {n:.1f}/{total:.1f} 秒音频 [已耗时: {elapsed}, 预计剩余: {remaining}]"
-        
+
         with tqdm(total=total_audio_duration, unit="秒", bar_format=pbar_format) as pbar:
             for idx, chunk_file in enumerate(chunk_files):
                 chunk_duration = get_wav_duration(chunk_file)
-                
-                # 狸猫换太子：暂时把系统的打印输出重定向到我们的解析器，以拦截底层时间戳
-                logger = WhisperProgressLogger(pbar)
-                old_stdout = sys.stdout
-                sys.stdout = logger
-                
-                try:
-                    # verbose=True 会输出时间戳，刚好被上面的 logger 捕获并转换成进度条
-                    result = model.transcribe(chunk_file, language="zh", fp16=use_fp16, verbose=True)
-                finally:
-                    # 本段结束，把系统的打印输出还回去
-                    sys.stdout = old_stdout
-                
-                # 补齐误差（比如最后半秒钟 Whisper 没有打印出来）
-                unprocessed = chunk_duration - logger.max_sec_seen
-                if unprocessed > 0:
-                    pbar.update(unprocessed)
-                
-                # 识别完一段，立刻将文字带上时间戳追加保存到文件中
-                with open(output_path, "a", encoding="utf-8") as f:
-                    # ffmpeg 按 600 秒切片，我们加上这个基础偏移量来计算全局真实时间
-                    chunk_offset = idx * 600.0
-                    for segment in result.get("segments", []):
-                        start_time = chunk_offset + segment["start"]
-                        end_time = chunk_offset + segment["end"]
-                        text = segment["text"].strip()
-                        if text:
-                            # 输出格式: [00:05:21 - 00:05:25] 大家好，欢迎来到本期视频。
-                            f.write(f"[{format_time(start_time)} - {format_time(end_time)}] {text}\n")
-                    
-                # 处理完一个片段就删掉一个临时文件
+                chunk_offset = idx * 600.0
+
+                with open(output_path, "a", encoding="utf-8") as output_file:
+                    if backend_kind == "openvino":
+                        audio_samples = load_wav_samples_for_openvino(chunk_file)
+                        result = ov_pipeline.generate(
+                            audio_samples,
+                            return_timestamps=True,
+                            task="transcribe",
+                            language=OPENVINO_LANGUAGE_TOKEN,
+                        )
+
+                        chunks = getattr(result, "chunks", [])
+                        if chunks:
+                            for segment in chunks:
+                                segment_start = chunk_offset + float(segment.start_ts)
+                                segment_end = chunk_offset + float(segment.end_ts)
+                                text = str(segment.text).strip()
+                                if text:
+                                    output_file.write(
+                                        f"[{format_time(segment_start)} - {format_time(segment_end)}] {text}\n"
+                                    )
+                        else:
+                            text = str(getattr(result, "text", result)).strip()
+                            if text:
+                                output_file.write(
+                                    f"[{format_time(chunk_offset)} - {format_time(chunk_offset + chunk_duration)}] {text}\n"
+                                )
+
+                        pbar.update(chunk_duration)
+                    else:
+                        logger = WhisperProgressLogger(pbar)
+                        old_stdout = sys.stdout
+                        sys.stdout = logger
+
+                        try:
+                            result = model.transcribe(
+                                chunk_file,
+                                language="zh",
+                                fp16=use_fp16,
+                                verbose=True,
+                            )
+                        finally:
+                            sys.stdout = old_stdout
+
+                        unprocessed = chunk_duration - logger.max_sec_seen
+                        if unprocessed > 0:
+                            pbar.update(unprocessed)
+
+                        for segment in result.get("segments", []):
+                            segment_start = chunk_offset + segment["start"]
+                            segment_end = chunk_offset + segment["end"]
+                            text = segment["text"].strip()
+                            if text:
+                                output_file.write(
+                                    f"[{format_time(segment_start)} - {format_time(segment_end)}] {text}\n"
+                                )
+
                 try:
                     os.remove(chunk_file)
-                except:
+                except OSError:
                     pass
-            
-    except Exception as e:
-        # 万一报错了，确保控制台输出被恢复
-        sys.stdout = sys.__stdout__
-        print(f"\n❌ 识别过程出错: {e}")
-        return
 
-    end_time = time.time()
-    print(f"\n🎉 识别大功告成！总处理耗时: {end_time - start_time:.2f} 秒")
-    print(f"📄 所有的文字结果已合并并保存至: {output_path}")
+    except Exception as exc:
+        sys.stdout = sys.__stdout__
+        print(f"\n❌ 识别过程出错: {exc}")
+        return
+    finally:
+        cleanup_temp_chunks()
+
+    elapsed = time.time() - process_start_time
+    print(f"\n🎉 识别完成，总处理耗时: {elapsed:.2f} 秒")
+    print(f"📄 转写结果已保存至: {output_path}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="免费高质量语音/视频转文字工具 (基于 OpenAI Whisper)")
-    parser.add_argument("input_file", help="要转换的音频或视频文件路径")
-    parser.add_argument("--model", default="small", choices=["tiny", "base", "small", "medium", "large", "turbo"], 
-                        help="使用的模型大小，默认为 'small'。想要更高质量可以选择 'medium' 或 'large'")
-    
+    parser = argparse.ArgumentParser(description="本地音视频转文字工具（支持 Whisper / OpenVINO / B 站链接）")
+    parser.add_argument("input_file", help="本地音视频文件路径，或 B 站视频链接")
+    parser.add_argument(
+        "--model",
+        default="small",
+        choices=["tiny", "base", "small", "medium", "large", "turbo"],
+        help="Whisper 模型大小，默认 small",
+    )
+    parser.add_argument("--cookies", help="可选：B 站 cookies.txt 文件路径")
+    parser.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", "cpu", "cuda", "rocm", "openvino"],
+        help="推理后端。auto 会优先尝试 AMD ROCm，其次 NVIDIA CUDA，再其次 Intel OpenVINO，最后回退 CPU。",
+    )
+    parser.add_argument(
+        "--openvino-device",
+        default="AUTO",
+        choices=["AUTO", "CPU", "GPU", "NPU"],
+        help="当 backend=openvino 时使用的设备。AUTO 在 Intel 机器上会优先尝试 GPU，再回退 CPU。",
+    )
+    parser.add_argument(
+        "--hf-endpoint",
+        help="可选：指定 Hugging Face Hub 地址或镜像源，例如 https://hf-mirror.com 。",
+    )
+    parser.add_argument(
+        "--hf-timeout",
+        type=int,
+        help="可选：指定 Hugging Face metadata / download 超时秒数，例如 60。",
+    )
+
     args = parser.parse_args()
-    
-    if not os.path.exists(args.input_file):
-        print(f"❌ 错误: 找不到文件 '{args.input_file}'")
-    else:
-        transcribe_audio(args.input_file, args.model)
+
+    try:
+        resolved_input_path, output_stem, output_dir = resolve_input_source(args.input_file, args.cookies)
+        transcribe_audio(
+            resolved_input_path,
+            model_name=args.model,
+            output_stem=output_stem,
+            output_dir=output_dir,
+            backend=args.backend,
+            openvino_device=args.openvino_device,
+            hf_endpoint=get_effective_hf_endpoint(args.hf_endpoint),
+            hf_timeout=args.hf_timeout,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(f"❌ 错误: {exc}")

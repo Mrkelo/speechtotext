@@ -2,7 +2,9 @@ openai-whisper
 torch
 setuptools-rust
 tqdm
-
-# --- 可选硬件加速插件 ---
-# 如果你是 AMD 或 Intel 显卡用户，请取消下面这行的注释并安装，即可启用 GPU 满血加速
-# torch-directml
+yt-dlp
+numpy
+openvino
+openvino-genai
+openvino-tokenizers
+huggingface_hub
