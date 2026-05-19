@@ -1,6 +1,7 @@
 ﻿import argparse
 import glob
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -51,6 +52,7 @@ DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 DEFAULT_HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_ETAG_TIMEOUT = 30
 DEFAULT_HF_DOWNLOAD_TIMEOUT = 120
+DEFAULT_BEAM_SIZE = 5
 
 
 def get_wav_duration(file_path):
@@ -162,6 +164,18 @@ def parse_positive_int(raw_value):
     return parsed_value if parsed_value > 0 else None
 
 
+def parse_beam_size_arg(raw_value):
+    try:
+        parsed_value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("beam size 必须是正整数。") from exc
+
+    if parsed_value <= 0:
+        raise argparse.ArgumentTypeError("beam size 必须大于 0。")
+
+    return parsed_value
+
+
 def get_effective_hf_timeouts(cli_timeout=None):
     cli_value = parse_positive_int(cli_timeout)
     if cli_value is not None:
@@ -209,6 +223,25 @@ def is_likely_network_error(exc):
         "proxyerror",
     ]
     return any(marker in error_text for marker in network_markers)
+
+
+def get_installed_package_version(package_name):
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def format_openvino_runtime_versions():
+    package_names = ["openvino", "openvino-genai", "openvino-tokenizers"]
+    version_items = []
+
+    for package_name in package_names:
+        version_text = get_installed_package_version(package_name)
+        if version_text:
+            version_items.append(f"{package_name}={version_text}")
+
+    return ", ".join(version_items) if version_items else "unknown"
 
 
 def format_openvino_download_failure(model_repo, model_dir, endpoint_errors, etag_timeout, download_timeout):
@@ -366,6 +399,50 @@ def load_openvino_pipeline(model_name, preferred_device, hf_endpoint=None, hf_ti
             last_error = exc
 
     raise RuntimeError(f"OpenVINO 后端初始化失败: {last_error}")
+
+
+def build_openvino_generation_config(ov_pipeline, beam_size):
+    generation_config = ov_pipeline.get_generation_config()
+    generation_config.return_timestamps = True
+    generation_config.task = "transcribe"
+    generation_config.language = OPENVINO_LANGUAGE_TOKEN
+    generation_config.num_beams = beam_size
+    return generation_config
+
+
+def run_openvino_transcription(ov_pipeline, audio_samples, beam_size):
+    generation_config = build_openvino_generation_config(ov_pipeline, beam_size)
+    return ov_pipeline.generate(audio_samples, generation_config)
+
+
+def is_openvino_beam_search_known_issue(exc, beam_size):
+    if beam_size <= 1:
+        return False
+
+    error_text = str(exc).lower()
+    markers = [
+        "beam idx batch",
+        "b == b_state",
+        "scaleddotproductattentionwithkvcache",
+        "not implemented",
+        "iremote_tensor",
+        "remote_tensor",
+    ]
+    return any(marker in error_text for marker in markers)
+
+
+def format_openvino_beam_search_failure(exc, device_name, beam_size):
+    versions = format_openvino_runtime_versions()
+    lines = [
+        f"OpenVINO beam search 运行失败: device={device_name}, beam_size={beam_size}",
+        f"当前 OpenVINO 版本: {versions}",
+        f"原始错误: {exc}",
+        "可尝试：",
+        "1. 升级 `openvino` / `openvino-genai` / `openvino-tokenizers` 到同一 2025.2+ 或更新版本。",
+        "2. 保持 beam search，但改用 `--openvino-device CPU`。",
+        "3. 如果优先追求 Intel GPU 速度，改用 `--beam-size 1` 关闭 beam search。",
+    ]
+    return "\n".join(lines)
 
 
 def load_whisper_model(model_name, backend_kind):
@@ -561,13 +638,16 @@ def transcribe_audio(
     output_dir=None,
     backend="auto",
     openvino_device="AUTO",
+    beam_size=DEFAULT_BEAM_SIZE,
     hf_endpoint=None,
     hf_timeout=None,
 ):
     backend_kind, backend_name = get_execution_backend(backend, model_name)
     use_fp16 = backend_kind in {"cuda", "rocm"}
+    whisper_beam_size = None if beam_size == 1 else beam_size
 
     print(f"🚀 当前实际运行模式: {backend_name}")
+    print(f"🧠 当前解码 beam size: {beam_size}")
     print(f"正在加载 Whisper 模型 '{model_name}' (首次运行会自动下载模型，请耐心等待)...")
 
     try:
@@ -648,12 +728,15 @@ def transcribe_audio(
                 with open(output_path, "a", encoding="utf-8") as output_file:
                     if backend_kind == "openvino":
                         audio_samples = load_wav_samples_for_openvino(chunk_file)
-                        result = ov_pipeline.generate(
-                            audio_samples,
-                            return_timestamps=True,
-                            task="transcribe",
-                            language=OPENVINO_LANGUAGE_TOKEN,
-                        )
+                        try:
+                            result = run_openvino_transcription(ov_pipeline, audio_samples, beam_size)
+                        except Exception as exc:
+                            if is_openvino_beam_search_known_issue(exc, beam_size):
+                                raise RuntimeError(
+                                    format_openvino_beam_search_failure(exc, ov_device_name, beam_size)
+                                ) from exc
+                            else:
+                                raise
 
                         chunks = getattr(result, "chunks", [])
                         if chunks:
@@ -682,6 +765,7 @@ def transcribe_audio(
                             result = model.transcribe(
                                 chunk_file,
                                 language="zh",
+                                beam_size=whisper_beam_size,
                                 fp16=use_fp16,
                                 verbose=True,
                             )
@@ -741,6 +825,12 @@ if __name__ == "__main__":
         help="当 backend=openvino 时使用的设备。AUTO 在 Intel 机器上会优先尝试 GPU，再回退 CPU。",
     )
     parser.add_argument(
+        "--beam-size",
+        type=parse_beam_size_arg,
+        default=DEFAULT_BEAM_SIZE,
+        help="解码 beam size，默认 5。传 1 可关闭 beam search。",
+    )
+    parser.add_argument(
         "--hf-endpoint",
         help="可选：指定 Hugging Face Hub 地址或镜像源，例如 https://hf-mirror.com 。",
     )
@@ -761,6 +851,7 @@ if __name__ == "__main__":
             output_dir=output_dir,
             backend=args.backend,
             openvino_device=args.openvino_device,
+            beam_size=args.beam_size,
             hf_endpoint=get_effective_hf_endpoint(args.hf_endpoint),
             hf_timeout=args.hf_timeout,
         )

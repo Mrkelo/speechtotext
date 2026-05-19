@@ -44,6 +44,27 @@ python speech_to_text.py "https://www.bilibili.com/video/BVxxxxxxxxxx"
 python speech_to_text.py "https://www.bilibili.com/video/BVxxxxxxxxxx" --cookies ".\cookies.txt"
 ```
 
+## 解码参数
+
+脚本现在支持统一的 `--beam-size` 参数，默认值是 `5`，同时作用于：
+
+- `Whisper` 后端的 `beam_size`
+- `OpenVINO` 后端的 `num_beams`
+
+示例：
+
+```powershell
+python speech_to_text.py "你的音视频文件路径" --beam-size 5
+```
+
+如果你想关闭 beam search，可以传 `1`：
+
+```powershell
+python speech_to_text.py "你的音视频文件路径" --beam-size 1
+```
+
+如果你在 Intel `OpenVINO + GPU` 路径下使用 `--beam-size 2` 或更大，命中当前 OpenVINO 运行时的 beam search 兼容性问题时，脚本会直接报错，并提示你改用 `--openvino-device CPU` 或 `--beam-size 1`。
+
 ## 后端说明
 
 ### NVIDIA
@@ -80,6 +101,12 @@ python speech_to_text.py "你的音视频文件路径" --backend openvino --open
 - `CPU`
 - `GPU`
 - `NPU`
+
+如果你准备在 Intel 机器上启用 beam search，建议把这几个包保持为同一版本线，并优先使用 `2025.2+` 或更新版本：
+
+- `openvino`
+- `openvino-genai`
+- `openvino-tokenizers`
 
 当前 OpenVINO 路径支持的模型：
 
