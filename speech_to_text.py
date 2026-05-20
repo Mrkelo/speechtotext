@@ -6,8 +6,10 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import wave
 from urllib.parse import parse_qs, urlparse
@@ -24,6 +26,11 @@ os.environ["PATH"] = SCRIPT_DIR + os.pathsep + FFMPEG_BIN_DIR + os.pathsep + os.
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 BILIBILI_CACHE_ROOT = os.path.join(SCRIPT_DIR, "cache", "bilibili")
 OPENVINO_CACHE_ROOT = os.path.join(SCRIPT_DIR, "cache", "openvino")
+WHISPERCPP_CACHE_ROOT = os.path.join(SCRIPT_DIR, "cache", "whispercpp")
+WHISPERCPP_MODEL_REPO_ID = "ggerganov/whisper.cpp"
+WHISPER_RUNTIME_ROOT = os.path.join(SCRIPT_DIR, "whisper")
+BILIBILI_DOWNLOAD_KIND = "video"
+BILIBILI_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".flv", ".mov"}
 
 OPENVINO_WHISPER_MODELS = {
     "tiny": "OpenVINO/whisper-tiny-fp16-ov",
@@ -47,12 +54,25 @@ OPENVINO_REQUIRED_FILES = [
     "preprocessor_config.json",
 ]
 
+WHISPERCPP_MODEL_FILENAMES = {
+    "tiny": "ggml-tiny.bin",
+    "base": "ggml-base.bin",
+    "small": "ggml-small.bin",
+    "medium": "ggml-medium.bin",
+    "large": "ggml-large-v3.bin",
+    "turbo": "ggml-large-v3-turbo.bin",
+}
+
 OPENVINO_LANGUAGE_TOKEN = "<|zh|>"
 DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 DEFAULT_HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
 DEFAULT_HF_ETAG_TIMEOUT = 30
 DEFAULT_HF_DOWNLOAD_TIMEOUT = 120
 DEFAULT_BEAM_SIZE = 5
+SEGMENT_SECONDS = 600
+TEMP_FULL_AUDIO_FILE = os.path.join(SCRIPT_DIR, "temp_full_audio.wav")
+TEMP_CHUNK_PATTERN = os.path.join(SCRIPT_DIR, "temp_chunk_%03d.wav")
+TEMP_CHUNK_GLOB = os.path.join(SCRIPT_DIR, "temp_chunk_*.wav")
 
 
 def get_wav_duration(file_path):
@@ -140,6 +160,39 @@ def can_use_openvino():
         return True
     except ImportError:
         return False
+
+
+def get_whispercpp_binary_candidates(explicit_path=None):
+    executable_name = "whisper-cli.exe" if os.name == "nt" else "whisper-cli"
+    candidates = [
+        explicit_path,
+        os.environ.get("WHISPERCPP_BINARY"),
+        os.path.join(WHISPER_RUNTIME_ROOT, executable_name),
+        os.path.join(WHISPER_RUNTIME_ROOT, "build", "bin", executable_name),
+        os.path.join(WHISPER_RUNTIME_ROOT, "build", "bin", "Release", executable_name),
+        os.path.join(WHISPER_RUNTIME_ROOT, "build", "bin", "RelWithDebInfo", executable_name),
+        os.path.join(WHISPER_RUNTIME_ROOT, "bin", executable_name),
+        os.path.join(WHISPER_RUNTIME_ROOT, "bin", "Release", executable_name),
+        os.path.join(SCRIPT_DIR, executable_name),
+        shutil.which(executable_name),
+        shutil.which("whisper-cli"),
+    ]
+    normalized = []
+    for candidate in candidates:
+        if candidate and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
+
+
+def resolve_whispercpp_binary(explicit_path=None):
+    for candidate in get_whispercpp_binary_candidates(explicit_path):
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def can_use_whispercpp_vulkan(explicit_path=None):
+    return bool(resolve_whispercpp_binary(explicit_path))
 
 
 def normalize_hf_endpoint(endpoint):
@@ -268,7 +321,108 @@ def format_openvino_download_failure(model_repo, model_dir, endpoint_errors, eta
     return "\n".join(lines)
 
 
-def get_execution_backend(preferred_backend, model_name):
+def get_whispercpp_model_cache_dir():
+    return os.path.join(WHISPERCPP_CACHE_ROOT, "models")
+
+
+def get_whispercpp_model_filename(model_name):
+    if model_name not in WHISPERCPP_MODEL_FILENAMES:
+        supported = ", ".join(WHISPERCPP_MODEL_FILENAMES.keys())
+        raise RuntimeError(f"whisper.cpp Vulkan 后端当前仅支持 {supported}，收到的是 '{model_name}'。")
+    return WHISPERCPP_MODEL_FILENAMES[model_name]
+
+
+def get_whispercpp_model_path(model_name):
+    return os.path.join(get_whispercpp_model_cache_dir(), get_whispercpp_model_filename(model_name))
+
+
+def format_whispercpp_download_failure(model_filename, model_dir, endpoint_errors, etag_timeout, download_timeout):
+    attempted = " -> ".join(format_hf_endpoint_label(endpoint) for endpoint, _ in endpoint_errors)
+    lines = [
+        f"whisper.cpp 模型下载失败: {model_filename}",
+        f"缓存目录: {model_dir}",
+        f"已尝试地址: {attempted}",
+        f"当前超时设置: metadata={etag_timeout}s, download={download_timeout}s",
+    ]
+
+    for endpoint, exc in endpoint_errors:
+        lines.append(f"- {format_hf_endpoint_label(endpoint)}: {exc}")
+
+    lines.extend(
+        [
+            "可尝试：",
+            "1. 在中国大陆网络下加 `--hf-endpoint https://hf-mirror.com`。",
+            "2. 慢网环境下加 `--hf-timeout 60` 或更大。",
+            "3. 也可以手工下载 ggml 模型后放到 `cache/whispercpp/models/`。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def ensure_whispercpp_model(model_name, hf_endpoint=None, hf_timeout=None):
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 huggingface_hub，请先执行 `pip install -r requirements.txt`。") from exc
+
+    model_dir = get_whispercpp_model_cache_dir()
+    model_filename = get_whispercpp_model_filename(model_name)
+    model_path = os.path.join(model_dir, model_filename)
+    if os.path.exists(model_path):
+        return model_path
+
+    os.makedirs(model_dir, exist_ok=True)
+    endpoint_candidates = build_hf_endpoint_candidates(hf_endpoint)
+    etag_timeout, download_timeout = get_effective_hf_timeouts(hf_timeout)
+
+    os.environ["HF_HUB_ETAG_TIMEOUT"] = str(etag_timeout)
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(download_timeout)
+
+    print(f"正在下载 whisper.cpp 模型: {model_filename}")
+    print(f"metadata 超时: {etag_timeout}s, download 超时: {download_timeout}s")
+
+    endpoint_errors = []
+    for endpoint in endpoint_candidates:
+        print(f"正在尝试模型下载源: {format_hf_endpoint_label(endpoint)}")
+        try:
+            snapshot_download(
+                repo_id=WHISPERCPP_MODEL_REPO_ID,
+                local_dir=model_dir,
+                allow_patterns=[model_filename],
+                endpoint=endpoint,
+                etag_timeout=etag_timeout,
+                max_workers=4,
+            )
+            break
+        except Exception as exc:
+            endpoint_errors.append((endpoint, exc))
+            if os.path.exists(model_path):
+                print("检测到本地 whisper.cpp 模型缓存，继续使用本地缓存。")
+                return model_path
+
+            if is_likely_network_error(exc):
+                print(f"当前下载源连接超时或失败，准备尝试下一个地址: {exc}")
+            else:
+                print(f"当前下载源失败，准备尝试下一个地址: {exc}")
+    else:
+        raise RuntimeError(
+            format_whispercpp_download_failure(
+                model_filename,
+                model_dir,
+                endpoint_errors,
+                etag_timeout,
+                download_timeout,
+            )
+        )
+
+    if not os.path.exists(model_path):
+        raise RuntimeError("whisper.cpp 模型下载完成，但缓存目录中仍未找到目标 ggml 模型文件。")
+
+    print(f"✅ whisper.cpp 模型已缓存到: {model_path}")
+    return model_path
+
+
+def get_execution_backend(preferred_backend, model_name, whispercpp_binary=None):
     if preferred_backend == "cuda":
         if not is_cuda_available():
             raise RuntimeError("当前环境没有可用的 NVIDIA CUDA。")
@@ -287,6 +441,17 @@ def get_execution_backend(preferred_backend, model_name):
             raise RuntimeError(f"OpenVINO 后端当前仅支持 {supported}，收到的是 '{model_name}'。")
         return "openvino", "Intel OpenVINO 后端"
 
+    if preferred_backend == "whispercpp-vulkan":
+        if not can_use_whispercpp_vulkan(whispercpp_binary):
+            raise RuntimeError(
+                "当前环境没有找到 whisper.cpp 的 `whisper-cli` 可执行文件。"
+                " 请先把运行环境放到项目根目录的 `whisper/` 下，或通过 `--whispercpp-binary` 指定路径。"
+            )
+        if model_name not in WHISPERCPP_MODEL_FILENAMES:
+            supported = ", ".join(WHISPERCPP_MODEL_FILENAMES.keys())
+            raise RuntimeError(f"whisper.cpp Vulkan 后端当前仅支持 {supported}，收到的是 '{model_name}'。")
+        return "whispercpp-vulkan", "whisper.cpp 路径 (期望 Vulkan GPU)"
+
     if preferred_backend == "cpu":
         return "cpu", "纯 CPU"
 
@@ -294,6 +459,8 @@ def get_execution_backend(preferred_backend, model_name):
         return "rocm", "AMD GPU (ROCm 加速)"
     if is_cuda_available():
         return "cuda", "NVIDIA GPU (CUDA 加速)"
+    if detect_host_vendor() == "amd" and can_use_whispercpp_vulkan(whispercpp_binary):
+        return "whispercpp-vulkan", "AMD 路径 (whisper.cpp，期望 Vulkan GPU)"
     if detect_host_vendor() == "intel" and can_use_openvino() and model_name in OPENVINO_WHISPER_MODELS:
         return "openvino", "Intel OpenVINO 后端"
     return "cpu", "纯 CPU"
@@ -445,6 +612,195 @@ def format_openvino_beam_search_failure(exc, device_name, beam_size):
     return "\n".join(lines)
 
 
+def load_whispercpp_runtime(model_name, whispercpp_binary=None, hf_endpoint=None, hf_timeout=None):
+    binary_path = resolve_whispercpp_binary(whispercpp_binary)
+    if not binary_path:
+        raise RuntimeError(
+            "没有找到 whisper.cpp 的 `whisper-cli` 可执行文件。"
+            " 请先把运行环境放到项目根目录的 `whisper/` 下，或通过 `--whispercpp-binary` 指定路径。"
+        )
+
+    model_path = ensure_whispercpp_model(model_name, hf_endpoint=hf_endpoint, hf_timeout=hf_timeout)
+    return binary_path, model_path
+
+
+def parse_srt_timestamp(raw_value):
+    hours_text, minutes_text, seconds_text = raw_value.split(":")
+    seconds_text, millis_text = seconds_text.split(",")
+    return (
+        int(hours_text) * 3600
+        + int(minutes_text) * 60
+        + int(seconds_text)
+        + int(millis_text) / 1000.0
+    )
+
+
+def parse_srt_segments(srt_path):
+    with open(srt_path, "r", encoding="utf-8") as srt_file:
+        blocks = re.split(r"\r?\n\r?\n", srt_file.read().strip())
+
+    segments = []
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+
+        timing_line = lines[1]
+        match = re.match(
+            r"(\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2},\d{3})",
+            timing_line,
+        )
+        if not match:
+            continue
+
+        text = " ".join(lines[2:]).strip()
+        if not text:
+            continue
+
+        segments.append(
+            {
+                "start": parse_srt_timestamp(match.group(1)),
+                "end": parse_srt_timestamp(match.group(2)),
+                "text": text,
+            }
+        )
+
+    return segments
+
+
+def format_whispercpp_failure(command, returncode, stderr_text, stdout_text):
+    lines = [
+        "whisper.cpp 转写失败。",
+        f"退出码: {returncode}",
+        f"命令: {' '.join(command)}",
+    ]
+
+    if stderr_text.strip():
+        lines.append(f"stderr: {stderr_text.strip()}")
+    if stdout_text.strip():
+        lines.append(f"stdout: {stdout_text.strip()}")
+
+    if returncode == 3221225781:
+        lines.append(
+            "诊断：Windows 退出码 3221225781 (0xC0000135) 通常表示程序依赖的 DLL 或运行时组件缺失。"
+        )
+        lines.append(
+            "优先检查：不要只单独复制 `whisper-cli.exe`，应当保留同一构建/发布目录中的配套 DLL，并优先使用项目根目录 `whisper/` 下的整套运行环境。"
+        )
+
+    lines.extend(
+        [
+            "可尝试：",
+            "1. 确认 `whisper-cli` 是用 `-DGGML_VULKAN=1` 构建的 Vulkan 版本。",
+            "2. 确认系统 Vulkan 运行时和 AMD 驱动正常。",
+            "3. 如果只是要先跑通流程，可改用 `--backend cpu` 或已支持的 `--backend rocm`。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def detect_whispercpp_runtime_mode(stdout_text, stderr_text):
+    combined_text = f"{stdout_text}\n{stderr_text}".lower()
+
+    if "ggml_vulkan:" in combined_text:
+        return "vulkan"
+
+    if "no gpu found" in combined_text or "whisper_backend_init_gpu: device 0: cpu" in combined_text:
+        return "cpu-fallback"
+
+    if "use gpu" in combined_text and "ggml_vulkan" not in combined_text:
+        return "unknown-gpu"
+
+    return "unknown"
+
+
+def format_whispercpp_gpu_required_failure(binary_path, runtime_mode, stdout_text, stderr_text):
+    lines = [
+        "whisper.cpp Vulkan 后端没有成功启用 GPU，已停止转写。",
+        f"whisper-cli: {binary_path}",
+        f"检测结果: {runtime_mode}",
+        "原因：当前选择的是 `--backend whispercpp-vulkan`，脚本要求日志中出现 `ggml_vulkan:` 才继续运行。",
+    ]
+
+    if stderr_text.strip():
+        lines.append(f"stderr: {stderr_text.strip()}")
+    if stdout_text.strip():
+        lines.append(f"stdout: {stdout_text.strip()}")
+
+    lines.extend(
+        [
+            "可尝试：",
+            "1. 重新构建 whisper.cpp：`cmake -B build -DGGML_VULKAN=1`，并使用 build 输出目录中的 `whisper-cli`。",
+            "2. 确认 AMD 驱动和 Vulkan Runtime 正常，手工运行时应能看到 `ggml_vulkan: Found ...`。",
+            "3. 如果只想先跑通转写，请改用 `--backend cpu`。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_whispercpp_subprocess_env(binary_path):
+    env = os.environ.copy()
+    path_entries = [
+        os.path.dirname(binary_path),
+        WHISPER_RUNTIME_ROOT,
+        os.path.join(WHISPER_RUNTIME_ROOT, "bin"),
+        os.path.join(WHISPER_RUNTIME_ROOT, "build", "bin"),
+        os.path.join(WHISPER_RUNTIME_ROOT, "build", "bin", "Release"),
+        os.path.join(WHISPER_RUNTIME_ROOT, "build", "bin", "RelWithDebInfo"),
+        env.get("PATH", ""),
+    ]
+    env["PATH"] = os.pathsep.join(entry for entry in path_entries if entry)
+    return env
+
+
+def run_whispercpp_transcription(binary_path, model_path, chunk_file, beam_size, temp_dir):
+    chunk_file = os.path.abspath(chunk_file)
+    model_path = os.path.abspath(model_path)
+    output_base = os.path.abspath(os.path.join(temp_dir, os.path.splitext(os.path.basename(chunk_file))[0]))
+    srt_path = f"{output_base}.srt"
+
+    command = [
+        binary_path,
+        "-m",
+        model_path,
+        "-f",
+        chunk_file,
+        "-l",
+        "zh",
+        "-bs",
+        str(beam_size),
+        "-osrt",
+        "-of",
+        output_base,
+        "-np",
+    ]
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        cwd=WHISPER_RUNTIME_ROOT if os.path.isdir(WHISPER_RUNTIME_ROOT) else os.path.dirname(binary_path),
+        env=build_whispercpp_subprocess_env(binary_path),
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            format_whispercpp_failure(command, completed.returncode, completed.stderr, completed.stdout)
+        )
+
+    if not os.path.exists(srt_path):
+        raise RuntimeError("whisper.cpp 运行完成，但没有生成预期的 SRT 输出文件。")
+
+    return {
+        "segments": parse_srt_segments(srt_path),
+        "runtime_mode": detect_whispercpp_runtime_mode(completed.stdout, completed.stderr),
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
 def load_whisper_model(model_name, backend_kind):
     device_name = "cuda" if backend_kind in {"cuda", "rocm"} else "cpu"
     return whisper.load_model(model_name, device=device_name)
@@ -510,26 +866,35 @@ def get_bilibili_cache_paths(url):
     return cache_dir, metadata_path
 
 
-def find_cached_media_file(cache_dir):
-    for candidate in sorted(glob.glob(os.path.join(cache_dir, "source.*"))):
-        if not os.path.isfile(candidate):
-            continue
+def find_cached_media_file(cache_dir, require_video=False):
+    patterns = [
+        os.path.join(cache_dir, "source_video.*"),
+        os.path.join(cache_dir, "source.*"),
+    ]
+    candidates = []
+    seen = set()
 
-        extension = os.path.splitext(candidate)[1].lower()
-        if extension in {".json", ".part", ".temp", ".ytdl"}:
-            continue
+    for pattern in patterns:
+        for candidate in sorted(glob.glob(pattern)):
+            if candidate in seen or not os.path.isfile(candidate):
+                continue
+            seen.add(candidate)
 
-        return candidate
+            extension = os.path.splitext(candidate)[1].lower()
+            if extension in {".json", ".part", ".temp", ".ytdl"}:
+                continue
+            if require_video and extension not in BILIBILI_VIDEO_EXTENSIONS:
+                continue
+
+            candidates.append(candidate)
+
+    return candidates[0] if candidates else None
 
     return None
 
 
 def load_cached_bilibili_media(url):
     cache_dir, metadata_path = get_bilibili_cache_paths(url)
-    media_path = find_cached_media_file(cache_dir)
-    if not media_path:
-        return None, None
-
     metadata = {}
     if os.path.exists(metadata_path):
         try:
@@ -537,6 +902,17 @@ def load_cached_bilibili_media(url):
                 metadata = json.load(metadata_file)
         except (OSError, json.JSONDecodeError):
             metadata = {}
+
+    media_path = find_cached_media_file(cache_dir, require_video=True)
+    if not media_path:
+        legacy_media_path = find_cached_media_file(cache_dir)
+        if legacy_media_path:
+            print(f"检测到旧版音频缓存，将重新下载视频缓存: {legacy_media_path}")
+        return None, None
+
+    if metadata.get("download_kind") != BILIBILI_DOWNLOAD_KIND:
+        print(f"检测到旧版 B 站缓存，将重新下载视频缓存: {media_path}")
+        return None, None
 
     output_stem = sanitize_filename(
         metadata.get("output_stem")
@@ -553,11 +929,30 @@ def write_bilibili_cache_metadata(metadata_path, source_url, info, output_stem):
         "video_id": info.get("id"),
         "title": info.get("title"),
         "output_stem": output_stem,
+        "download_kind": BILIBILI_DOWNLOAD_KIND,
+        "format_id": info.get("format_id"),
+        "ext": info.get("ext"),
         "cached_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
     with open(metadata_path, "w", encoding="utf-8") as metadata_file:
         json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+
+
+def build_bilibili_ydl_opts(cache_dir, cookies_path=None):
+    ydl_opts = {
+        "format": "bv*+ba/b",
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(cache_dir, "source_video.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    if cookies_path:
+        ydl_opts["cookiefile"] = cookies_path
+
+    return ydl_opts
 
 
 def download_bilibili_media(url, cookies_path=None):
@@ -577,33 +972,26 @@ def download_bilibili_media(url, cookies_path=None):
     cache_dir, metadata_path = get_bilibili_cache_paths(url)
     os.makedirs(cache_dir, exist_ok=True)
 
-    print("检测到 B 站链接，正在下载源视频/音频...")
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(cache_dir, "source.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-
+    print("检测到 B 站链接，正在下载源视频...")
     if cookies_path:
-        ydl_opts["cookiefile"] = cookies_path
+        print(f"正在使用 cookies 文件: {cookies_path}")
 
+    ydl_opts = build_bilibili_ydl_opts(cache_dir, cookies_path)
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except Exception as exc:
         raise RuntimeError(f"B 站视频下载失败: {exc}") from exc
 
-    downloaded_media_path = find_cached_media_file(cache_dir)
+    downloaded_media_path = find_cached_media_file(cache_dir, require_video=True)
     if not downloaded_media_path:
-        raise RuntimeError("B 站视频下载完成，但没有找到可转写的媒体文件。")
+        raise RuntimeError("B 站视频下载完成，但没有找到合并后的视频文件。")
 
     title = info.get("title") or info.get("id") or "bilibili_video"
     output_stem = sanitize_filename(title)
     write_bilibili_cache_metadata(metadata_path, url, info, output_stem)
 
-    print(f"✅ B 站内容下载完成，已缓存到: {cache_dir}")
+    print(f"✅ B 站视频下载完成，已缓存到: {cache_dir}")
     return downloaded_media_path, output_stem
 
 
@@ -623,12 +1011,261 @@ def resolve_input_source(input_value, cookies_path=None):
     return input_value, output_stem, output_dir
 
 
-def cleanup_temp_chunks():
-    for chunk_file in glob.glob("temp_chunk_*.wav"):
+def cleanup_temp_audio_files():
+    for chunk_file in glob.glob(TEMP_CHUNK_GLOB):
         try:
             os.remove(chunk_file)
         except OSError:
             pass
+
+    try:
+        os.remove(TEMP_FULL_AUDIO_FILE)
+    except OSError:
+        pass
+
+
+def preprocess_audio_to_wav(input_path):
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-vn",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        TEMP_FULL_AUDIO_FILE,
+    ]
+
+    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if not os.path.exists(TEMP_FULL_AUDIO_FILE):
+        raise RuntimeError("音频预处理失败，请检查输入文件是否有效或 ffmpeg 是否正常工作。")
+
+    return TEMP_FULL_AUDIO_FILE
+
+
+def split_wav_to_chunks(wav_path):
+    for chunk_file in glob.glob(TEMP_CHUNK_GLOB):
+        try:
+            os.remove(chunk_file)
+        except OSError:
+            pass
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        wav_path,
+        "-f",
+        "segment",
+        "-segment_time",
+        str(SEGMENT_SECONDS),
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        TEMP_CHUNK_PATTERN,
+    ]
+
+    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+    chunk_files = sorted(glob.glob(TEMP_CHUNK_GLOB))
+    if not chunk_files:
+        raise RuntimeError("音频分割失败，请检查输入文件是否有效或 ffmpeg 是否正常工作。")
+
+    return chunk_files
+
+
+def build_chunk_offsets(wav_files):
+    offsets = []
+    current_offset = 0.0
+
+    for wav_file in wav_files:
+        offsets.append(current_offset)
+        current_offset += get_wav_duration(wav_file)
+
+    return offsets
+
+
+def write_segment(output_file, start_time, end_time, text):
+    text = str(text).strip()
+    if text:
+        output_file.write(f"[{format_time(start_time)} - {format_time(end_time)}] {text}\n")
+
+
+def transcribe_wav_file(
+    wav_file,
+    chunk_offset,
+    output_file,
+    pbar,
+    backend_kind,
+    ov_pipeline,
+    ov_device_name,
+    whispercpp_runtime,
+    whispercpp_temp_dir,
+    whispercpp_runtime_state,
+    model,
+    use_fp16,
+    whisper_beam_size,
+    beam_size,
+):
+    chunk_duration = get_wav_duration(wav_file)
+
+    if backend_kind == "openvino":
+        audio_samples = load_wav_samples_for_openvino(wav_file)
+        try:
+            result = run_openvino_transcription(ov_pipeline, audio_samples, beam_size)
+        except Exception as exc:
+            if is_openvino_beam_search_known_issue(exc, beam_size):
+                raise RuntimeError(
+                    format_openvino_beam_search_failure(exc, ov_device_name, beam_size)
+                ) from exc
+            raise
+
+        chunks = getattr(result, "chunks", [])
+        if chunks:
+            for segment in chunks:
+                write_segment(
+                    output_file,
+                    chunk_offset + float(segment.start_ts),
+                    chunk_offset + float(segment.end_ts),
+                    segment.text,
+                )
+        else:
+            write_segment(
+                output_file,
+                chunk_offset,
+                chunk_offset + chunk_duration,
+                getattr(result, "text", result),
+            )
+
+        pbar.update(chunk_duration)
+        return
+
+    if backend_kind == "whispercpp-vulkan":
+        binary_path, model_path = whispercpp_runtime
+        whispercpp_result = run_whispercpp_transcription(
+            binary_path,
+            model_path,
+            wav_file,
+            beam_size,
+            whispercpp_temp_dir,
+        )
+
+        if not whispercpp_runtime_state["checked"]:
+            runtime_mode = whispercpp_result["runtime_mode"]
+            if runtime_mode == "vulkan":
+                print("✅ whisper.cpp 已检测到 Vulkan GPU 后端。")
+            else:
+                raise RuntimeError(
+                    format_whispercpp_gpu_required_failure(
+                        binary_path,
+                        runtime_mode,
+                        whispercpp_result["stdout"],
+                        whispercpp_result["stderr"],
+                    )
+                )
+            whispercpp_runtime_state["checked"] = True
+
+        for segment in whispercpp_result["segments"]:
+            write_segment(
+                output_file,
+                chunk_offset + segment["start"],
+                chunk_offset + segment["end"],
+                segment["text"],
+            )
+
+        pbar.update(chunk_duration)
+        return
+
+    logger = WhisperProgressLogger(pbar)
+    old_stdout = sys.stdout
+    sys.stdout = logger
+
+    try:
+        result = model.transcribe(
+            wav_file,
+            language="zh",
+            beam_size=whisper_beam_size,
+            fp16=use_fp16,
+            verbose=True,
+        )
+    finally:
+        sys.stdout = old_stdout
+
+    unprocessed = chunk_duration - logger.max_sec_seen
+    if unprocessed > 0:
+        pbar.update(unprocessed)
+
+    for segment in result.get("segments", []):
+        write_segment(
+            output_file,
+            chunk_offset + segment["start"],
+            chunk_offset + segment["end"],
+            segment["text"],
+        )
+
+
+def transcribe_wav_files(
+    wav_files,
+    output_path,
+    backend_kind,
+    ov_pipeline,
+    ov_device_name,
+    whispercpp_runtime,
+    whispercpp_temp_dir,
+    model,
+    use_fp16,
+    whisper_beam_size,
+    beam_size,
+):
+    total_audio_duration = sum(get_wav_duration(wav_file) for wav_file in wav_files)
+    chunk_offsets = build_chunk_offsets(wav_files) if len(wav_files) > 1 else [0.0]
+    whispercpp_runtime_state = {"checked": False}
+
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        output_file.write("")
+
+    pbar_format = "{l_bar}{bar}| 进度: {n:.1f}/{total:.1f} 秒音频 [已耗时: {elapsed}, 预计剩余: {remaining}]"
+
+    with tqdm(total=total_audio_duration, unit="秒", bar_format=pbar_format) as pbar:
+        for wav_file, chunk_offset in zip(wav_files, chunk_offsets):
+            with open(output_path, "a", encoding="utf-8") as output_file:
+                transcribe_wav_file(
+                    wav_file,
+                    chunk_offset,
+                    output_file,
+                    pbar,
+                    backend_kind,
+                    ov_pipeline,
+                    ov_device_name,
+                    whispercpp_runtime,
+                    whispercpp_temp_dir,
+                    whispercpp_runtime_state,
+                    model,
+                    use_fp16,
+                    whisper_beam_size,
+                    beam_size,
+                )
+
+    return total_audio_duration
+
+
+def should_use_segment_fallback(exc):
+    error_text = str(exc).lower()
+    non_segment_errors = [
+        "whisper.cpp vulkan 后端没有成功启用 gpu",
+        "ggml_vulkan",
+        "openvino beam search 运行失败",
+        "no gpu found",
+        "device 0: cpu",
+    ]
+    return not any(marker in error_text for marker in non_segment_errors)
 
 
 def transcribe_audio(
@@ -638,22 +1275,32 @@ def transcribe_audio(
     output_dir=None,
     backend="auto",
     openvino_device="AUTO",
+    whispercpp_binary=None,
+    force_segmented=False,
     beam_size=DEFAULT_BEAM_SIZE,
     hf_endpoint=None,
     hf_timeout=None,
 ):
-    backend_kind, backend_name = get_execution_backend(backend, model_name)
+    backend_kind, backend_name = get_execution_backend(
+        backend,
+        model_name,
+        whispercpp_binary=whispercpp_binary,
+    )
     use_fp16 = backend_kind in {"cuda", "rocm"}
     whisper_beam_size = None if beam_size == 1 else beam_size
 
     print(f"🚀 当前实际运行模式: {backend_name}")
     print(f"🧠 当前解码 beam size: {beam_size}")
-    print(f"正在加载 Whisper 模型 '{model_name}' (首次运行会自动下载模型，请耐心等待)...")
+    if backend_kind == "whispercpp-vulkan":
+        print(f"正在准备 whisper.cpp Vulkan 模型 '{model_name}' (首次运行会自动下载模型，请耐心等待)...")
+    else:
+        print(f"正在加载 Whisper 模型 '{model_name}' (首次运行会自动下载模型，请耐心等待)...")
 
     try:
         model = None
         ov_pipeline = None
         ov_device_name = None
+        whispercpp_runtime = None
 
         if backend_kind == "openvino":
             ov_pipeline, ov_device_name = load_openvino_pipeline(
@@ -663,6 +1310,15 @@ def transcribe_audio(
                 hf_timeout=hf_timeout,
             )
             print(f"✅ OpenVINO 设备初始化成功: {ov_device_name}")
+        elif backend_kind == "whispercpp-vulkan":
+            whispercpp_runtime = load_whispercpp_runtime(
+                model_name,
+                whispercpp_binary=whispercpp_binary,
+                hf_endpoint=hf_endpoint,
+                hf_timeout=hf_timeout,
+            )
+            print(f"✅ whisper.cpp 可执行文件: {whispercpp_runtime[0]}")
+            print(f"✅ whisper.cpp 模型文件: {whispercpp_runtime[1]}")
         else:
             model = load_whisper_model(model_name, backend_kind)
     except Exception as exc:
@@ -671,131 +1327,91 @@ def transcribe_audio(
             print("提示：请确认已安装 openvino / openvino-genai / huggingface_hub。")
             print("提示：如果是大陆网络，建议加 `--hf-endpoint https://hf-mirror.com`。")
             print("提示：如果是慢网，建议加 `--hf-timeout 60`。")
+        elif backend_kind == "whispercpp-vulkan":
+            print("提示：请确认已把支持 Vulkan 的 whisper.cpp 运行环境放到项目根目录的 `whisper/` 下，或通过 `--whispercpp-binary` 指向 `whisper-cli`。")
+            print("提示：模型会缓存到 `cache/whispercpp/models/`，也支持配合 `--hf-endpoint https://hf-mirror.com`。")
         elif backend_kind == "rocm":
             print("提示：请确认当前安装的是 AMD 官方 ROCm PyTorch，并且硬件在 ROCm 支持矩阵内。")
         else:
             print("提示：如果遇到网络问题，请检查网络连接或代理设置。")
         return
 
-    print("正在预处理音频：自动安全分段...")
+    print("正在预处理音频：转换为完整 WAV...")
     base_name = sanitize_filename(output_stem or os.path.splitext(os.path.basename(input_path))[0])
     output_directory = output_dir or os.getcwd()
     output_path = os.path.join(output_directory, f"{base_name}_转写结果.txt")
 
-    cleanup_temp_chunks()
-
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        input_path,
-        "-f",
-        "segment",
-        "-segment_time",
-        "600",
-        "-c:a",
-        "pcm_s16le",
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
-        "temp_chunk_%03d.wav",
-    ]
-
-    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-
-    chunk_files = sorted(glob.glob("temp_chunk_*.wav"))
-    if not chunk_files:
-        print("❌ 音频分割失败，请检查输入文件是否有效或 ffmpeg 是否正常工作。")
-        return
-
-    total_audio_duration = sum(get_wav_duration(chunk_file) for chunk_file in chunk_files)
-    print(f"✅ 音频预处理完毕，总时长约 {total_audio_duration / 60:.1f} 分钟。开始智能识别...\n")
-
     process_start_time = time.time()
-
-    with open(output_path, "w", encoding="utf-8") as output_file:
-        output_file.write("")
+    whispercpp_temp_dir = None
+    if backend_kind == "whispercpp-vulkan":
+        whispercpp_temp_dir = tempfile.mkdtemp(prefix="whispercpp_", dir=SCRIPT_DIR)
 
     try:
-        pbar_format = "{l_bar}{bar}| 进度: {n:.1f}/{total:.1f} 秒音频 [已耗时: {elapsed}, 预计剩余: {remaining}]"
+        cleanup_temp_audio_files()
+        full_audio_path = preprocess_audio_to_wav(input_path)
+        total_audio_duration = get_wav_duration(full_audio_path)
+        print(f"✅ 音频预处理完毕，总时长约 {total_audio_duration / 60:.1f} 分钟。开始智能识别...\n")
 
-        with tqdm(total=total_audio_duration, unit="秒", bar_format=pbar_format) as pbar:
-            for idx, chunk_file in enumerate(chunk_files):
-                chunk_duration = get_wav_duration(chunk_file)
-                chunk_offset = idx * 600.0
+        if force_segmented:
+            print("当前已启用强制分段模式，将使用分段备用路径。")
+            chunk_files = split_wav_to_chunks(full_audio_path)
+            transcribe_wav_files(
+                chunk_files,
+                output_path,
+                backend_kind,
+                ov_pipeline,
+                ov_device_name,
+                whispercpp_runtime,
+                whispercpp_temp_dir,
+                model,
+                use_fp16,
+                whisper_beam_size,
+                beam_size,
+            )
+        else:
+            try:
+                transcribe_wav_files(
+                    [full_audio_path],
+                    output_path,
+                    backend_kind,
+                    ov_pipeline,
+                    ov_device_name,
+                    whispercpp_runtime,
+                    whispercpp_temp_dir,
+                    model,
+                    use_fp16,
+                    whisper_beam_size,
+                    beam_size,
+                )
+            except Exception as exc:
+                if not should_use_segment_fallback(exc):
+                    raise
 
-                with open(output_path, "a", encoding="utf-8") as output_file:
-                    if backend_kind == "openvino":
-                        audio_samples = load_wav_samples_for_openvino(chunk_file)
-                        try:
-                            result = run_openvino_transcription(ov_pipeline, audio_samples, beam_size)
-                        except Exception as exc:
-                            if is_openvino_beam_search_known_issue(exc, beam_size):
-                                raise RuntimeError(
-                                    format_openvino_beam_search_failure(exc, ov_device_name, beam_size)
-                                ) from exc
-                            else:
-                                raise
-
-                        chunks = getattr(result, "chunks", [])
-                        if chunks:
-                            for segment in chunks:
-                                segment_start = chunk_offset + float(segment.start_ts)
-                                segment_end = chunk_offset + float(segment.end_ts)
-                                text = str(segment.text).strip()
-                                if text:
-                                    output_file.write(
-                                        f"[{format_time(segment_start)} - {format_time(segment_end)}] {text}\n"
-                                    )
-                        else:
-                            text = str(getattr(result, "text", result)).strip()
-                            if text:
-                                output_file.write(
-                                    f"[{format_time(chunk_offset)} - {format_time(chunk_offset + chunk_duration)}] {text}\n"
-                                )
-
-                        pbar.update(chunk_duration)
-                    else:
-                        logger = WhisperProgressLogger(pbar)
-                        old_stdout = sys.stdout
-                        sys.stdout = logger
-
-                        try:
-                            result = model.transcribe(
-                                chunk_file,
-                                language="zh",
-                                beam_size=whisper_beam_size,
-                                fp16=use_fp16,
-                                verbose=True,
-                            )
-                        finally:
-                            sys.stdout = old_stdout
-
-                        unprocessed = chunk_duration - logger.max_sec_seen
-                        if unprocessed > 0:
-                            pbar.update(unprocessed)
-
-                        for segment in result.get("segments", []):
-                            segment_start = chunk_offset + segment["start"]
-                            segment_end = chunk_offset + segment["end"]
-                            text = segment["text"].strip()
-                            if text:
-                                output_file.write(
-                                    f"[{format_time(segment_start)} - {format_time(segment_end)}] {text}\n"
-                                )
-
-                try:
-                    os.remove(chunk_file)
-                except OSError:
-                    pass
+                print(f"\n⚠️ 整体转写失败，准备启用分段备用方案: {exc}")
+                print("分段时间戳将按实际片段时长累计，避免固定 600 秒偏移造成漂移。\n")
+                chunk_files = split_wav_to_chunks(full_audio_path)
+                transcribe_wav_files(
+                    chunk_files,
+                    output_path,
+                    backend_kind,
+                    ov_pipeline,
+                    ov_device_name,
+                    whispercpp_runtime,
+                    whispercpp_temp_dir,
+                    model,
+                    use_fp16,
+                    whisper_beam_size,
+                    beam_size,
+                )
 
     except Exception as exc:
         sys.stdout = sys.__stdout__
         print(f"\n❌ 识别过程出错: {exc}")
         return
     finally:
-        cleanup_temp_chunks()
+        cleanup_temp_audio_files()
+        if whispercpp_temp_dir:
+            shutil.rmtree(whispercpp_temp_dir, ignore_errors=True)
 
     elapsed = time.time() - process_start_time
     print(f"\n🎉 识别完成，总处理耗时: {elapsed:.2f} 秒")
@@ -803,7 +1419,9 @@ def transcribe_audio(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="本地音视频转文字工具（支持 Whisper / OpenVINO / B 站链接）")
+    parser = argparse.ArgumentParser(
+        description="本地音视频转文字工具（支持 Whisper / whisper.cpp Vulkan / OpenVINO / B 站链接）"
+    )
     parser.add_argument("input_file", help="本地音视频文件路径，或 B 站视频链接")
     parser.add_argument(
         "--model",
@@ -815,8 +1433,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         default="auto",
-        choices=["auto", "cpu", "cuda", "rocm", "openvino"],
-        help="推理后端。auto 会优先尝试 AMD ROCm，其次 NVIDIA CUDA，再其次 Intel OpenVINO，最后回退 CPU。",
+        choices=["auto", "cpu", "cuda", "rocm", "openvino", "whispercpp-vulkan"],
+        help="推理后端。auto 会优先尝试 AMD ROCm，其次 NVIDIA CUDA，再其次 AMD whisper.cpp Vulkan，再其次 Intel OpenVINO，最后回退 CPU。",
     )
     parser.add_argument(
         "--openvino-device",
@@ -825,10 +1443,19 @@ if __name__ == "__main__":
         help="当 backend=openvino 时使用的设备。AUTO 在 Intel 机器上会优先尝试 GPU，再回退 CPU。",
     )
     parser.add_argument(
+        "--whispercpp-binary",
+        help="可选：指定 whisper.cpp 的 `whisper-cli` 可执行文件路径。若不传，脚本会优先在项目根目录的 `whisper/` 及其 build/bin 下自动查找。",
+    )
+    parser.add_argument(
         "--beam-size",
         type=parse_beam_size_arg,
         default=DEFAULT_BEAM_SIZE,
         help="解码 beam size，默认 5。传 1 可关闭 beam search。",
+    )
+    parser.add_argument(
+        "--segment-audio",
+        action="store_true",
+        help="强制使用旧的分段转写路径。默认会先整体转写，整体失败后才自动分段备用。",
     )
     parser.add_argument(
         "--hf-endpoint",
@@ -851,6 +1478,8 @@ if __name__ == "__main__":
             output_dir=output_dir,
             backend=args.backend,
             openvino_device=args.openvino_device,
+            whispercpp_binary=args.whispercpp_binary,
+            force_segmented=args.segment_audio,
             beam_size=args.beam_size,
             hf_endpoint=get_effective_hf_endpoint(args.hf_endpoint),
             hf_timeout=args.hf_timeout,
