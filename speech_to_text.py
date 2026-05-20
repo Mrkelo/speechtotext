@@ -70,9 +70,14 @@ DEFAULT_HF_ETAG_TIMEOUT = 30
 DEFAULT_HF_DOWNLOAD_TIMEOUT = 120
 DEFAULT_BEAM_SIZE = 5
 SEGMENT_SECONDS = 600
+OPENVINO_WINDOW_SECONDS = 30
+OPENVINO_SAMPLE_RATE = 16000
+PRINT_LIVE_TRANSCRIPT = False
 TEMP_FULL_AUDIO_FILE = os.path.join(SCRIPT_DIR, "temp_full_audio.wav")
 TEMP_CHUNK_PATTERN = os.path.join(SCRIPT_DIR, "temp_chunk_%03d.wav")
 TEMP_CHUNK_GLOB = os.path.join(SCRIPT_DIR, "temp_chunk_*.wav")
+WHISPER_TIMESTAMP_END_RE = re.compile(r'-->\s*(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})')
+WHISPERCPP_PROGRESS_RE = re.compile(r"progress\s*=\s*(\d+)%")
 
 
 def get_wav_duration(file_path):
@@ -89,26 +94,91 @@ def format_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-class WhisperProgressLogger:
-    def __init__(self, pbar):
-        self.pbar = pbar
-        self.max_sec_seen = 0.0
+def parse_whisper_timestamp_end(message):
+    match = WHISPER_TIMESTAMP_END_RE.search(message)
+    if not match:
+        return None
 
-    def write(self, message):
-        match = re.search(r'-->\s*(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})', message)
-        if not match:
+    hours, minutes, secs, millis = match.groups()
+    hours = int(hours) if hours else 0
+    return hours * 3600 + int(minutes) * 60 + int(secs) + int(millis) / 1000.0
+
+
+def update_pbar_multiplier(pbar, processed_seconds=None):
+    elapsed = time.time() - getattr(pbar, "start_t", time.time())
+    if elapsed <= 0:
+        multiplier = 0.0
+    else:
+        multiplier = float(pbar.n if processed_seconds is None else processed_seconds) / elapsed
+    pbar.set_postfix_str(f"倍率: {multiplier:.2f}x", refresh=False)
+
+
+class ChunkProgress:
+    def __init__(self, pbar, total_seconds):
+        self.pbar = pbar
+        self.total_seconds = max(float(total_seconds), 0.0)
+        self.current_seconds = 0.0
+
+    def update_to(self, seconds):
+        next_seconds = min(max(float(seconds), 0.0), self.total_seconds)
+        if next_seconds <= self.current_seconds:
             return
 
-        hours, minutes, secs, millis = match.groups()
-        hours = int(hours) if hours else 0
-        current_sec = hours * 3600 + int(minutes) * 60 + int(secs) + int(millis) / 1000.0
+        update_delta = next_seconds - self.current_seconds
+        update_pbar_multiplier(self.pbar, self.pbar.n + update_delta)
+        self.pbar.update(update_delta)
+        self.current_seconds = next_seconds
 
-        if current_sec > self.max_sec_seen:
-            self.pbar.update(current_sec - self.max_sec_seen)
-            self.max_sec_seen = current_sec
+    def finish(self):
+        self.update_to(self.total_seconds)
+
+
+class WhisperProgressLogger:
+    def __init__(self, pbar, chunk_duration, output_stream):
+        self.pbar = pbar
+        self.output_stream = getattr(pbar, "fp", None) or output_stream
+        self.progress = ChunkProgress(pbar, chunk_duration)
+
+    def write(self, message):
+        if PRINT_LIVE_TRANSCRIPT and message.strip():
+            tqdm.write(message.rstrip(), file=self.output_stream)
+
+        current_sec = parse_whisper_timestamp_end(message)
+        if current_sec is not None:
+            self.progress.update_to(current_sec)
+
+    def finish(self):
+        self.progress.finish()
 
     def flush(self):
-        pass
+        if hasattr(self.output_stream, "flush"):
+            self.output_stream.flush()
+
+
+class WhisperCppProgressLogger:
+    def __init__(self, pbar, chunk_duration):
+        self.output_stream = getattr(pbar, "fp", None) or sys.stderr
+        self.progress = ChunkProgress(pbar, chunk_duration)
+        self.displayed_segments = 0
+
+    def handle_line(self, line):
+        percent_match = WHISPERCPP_PROGRESS_RE.search(line)
+        if percent_match:
+            percent = min(max(int(percent_match.group(1)), 0), 100)
+            self.progress.update_to(self.progress.total_seconds * percent / 100.0)
+            return
+
+        current_sec = parse_whisper_timestamp_end(line)
+        if current_sec is None:
+            return
+
+        if PRINT_LIVE_TRANSCRIPT:
+            tqdm.write(line.rstrip(), file=self.output_stream)
+        self.displayed_segments += 1
+        self.progress.update_to(current_sec)
+
+    def finish(self):
+        self.progress.finish()
 
 
 def sanitize_filename(name):
@@ -753,7 +823,14 @@ def build_whispercpp_subprocess_env(binary_path):
     return env
 
 
-def run_whispercpp_transcription(binary_path, model_path, chunk_file, beam_size, temp_dir):
+def run_whispercpp_transcription(
+    binary_path,
+    model_path,
+    chunk_file,
+    beam_size,
+    temp_dir,
+    progress_logger=None,
+):
     chunk_file = os.path.abspath(chunk_file)
     model_path = os.path.abspath(model_path)
     output_base = os.path.abspath(os.path.join(temp_dir, os.path.splitext(os.path.basename(chunk_file))[0]))
@@ -772,22 +849,34 @@ def run_whispercpp_transcription(binary_path, model_path, chunk_file, beam_size,
         "-osrt",
         "-of",
         output_base,
-        "-np",
+        "-pp",
     ]
 
-    completed = subprocess.run(
+    process = subprocess.Popen(
         command,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
         cwd=WHISPER_RUNTIME_ROOT if os.path.isdir(WHISPER_RUNTIME_ROOT) else os.path.dirname(binary_path),
         env=build_whispercpp_subprocess_env(binary_path),
     )
-    if completed.returncode != 0:
+
+    combined_output = []
+    if process.stdout is not None:
+        for line in process.stdout:
+            combined_output.append(line)
+            if progress_logger is not None:
+                progress_logger.handle_line(line)
+
+    returncode = process.wait()
+    stdout_text = "".join(combined_output)
+    stderr_text = ""
+
+    if returncode != 0:
         raise RuntimeError(
-            format_whispercpp_failure(command, completed.returncode, completed.stderr, completed.stdout)
+            format_whispercpp_failure(command, returncode, stderr_text, stdout_text)
         )
 
     if not os.path.exists(srt_path):
@@ -795,9 +884,10 @@ def run_whispercpp_transcription(binary_path, model_path, chunk_file, beam_size,
 
     return {
         "segments": parse_srt_segments(srt_path),
-        "runtime_mode": detect_whispercpp_runtime_mode(completed.stdout, completed.stderr),
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "runtime_mode": detect_whispercpp_runtime_mode(stdout_text, stderr_text),
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "displayed_segments": progress_logger.displayed_segments if progress_logger is not None else 0,
     }
 
 
@@ -1092,10 +1182,90 @@ def build_chunk_offsets(wav_files):
     return offsets
 
 
-def write_segment(output_file, start_time, end_time, text):
+def format_segment_line(start_time, end_time, text):
     text = str(text).strip()
-    if text:
-        output_file.write(f"[{format_time(start_time)} - {format_time(end_time)}] {text}\n")
+    if not text:
+        return None
+    return f"[{format_time(start_time)} - {format_time(end_time)}] {text}"
+
+
+def write_segment(output_file, start_time, end_time, text, pbar=None, echo=False):
+    line = format_segment_line(start_time, end_time, text)
+    if not line:
+        return False
+
+    output_file.write(f"{line}\n")
+    output_file.flush()
+    if echo:
+        if pbar is None:
+            print(line)
+        else:
+            pbar.write(line)
+    return True
+
+
+def write_openvino_result(output_file, result, chunk_offset, window_offset, window_duration, pbar):
+    chunks = getattr(result, "chunks", [])
+    if chunks:
+        for segment in chunks:
+            segment_start = max(float(segment.start_ts), 0.0)
+            segment_end = min(max(float(segment.end_ts), segment_start), window_duration)
+            write_segment(
+                output_file,
+                chunk_offset + window_offset + segment_start,
+                chunk_offset + window_offset + segment_end,
+                segment.text,
+            )
+        return
+
+    write_segment(
+        output_file,
+        chunk_offset + window_offset,
+        chunk_offset + window_offset + window_duration,
+        getattr(result, "text", result),
+    )
+
+
+def transcribe_openvino_wav_file(
+    wav_file,
+    chunk_offset,
+    output_file,
+    pbar,
+    ov_pipeline,
+    ov_device_name,
+    beam_size,
+):
+    chunk_duration = get_wav_duration(wav_file)
+    chunk_progress = ChunkProgress(pbar, chunk_duration)
+    audio_samples = load_wav_samples_for_openvino(wav_file)
+    window_size = OPENVINO_SAMPLE_RATE * OPENVINO_WINDOW_SECONDS
+
+    for start_sample in range(0, len(audio_samples), window_size):
+        end_sample = min(start_sample + window_size, len(audio_samples))
+        window_samples = audio_samples[start_sample:end_sample]
+        window_offset = start_sample / OPENVINO_SAMPLE_RATE
+        window_duration = (end_sample - start_sample) / OPENVINO_SAMPLE_RATE
+
+        try:
+            result = run_openvino_transcription(ov_pipeline, window_samples, beam_size)
+        except Exception as exc:
+            if is_openvino_beam_search_known_issue(exc, beam_size):
+                raise RuntimeError(
+                    format_openvino_beam_search_failure(exc, ov_device_name, beam_size)
+                ) from exc
+            raise
+
+        write_openvino_result(
+            output_file,
+            result,
+            chunk_offset,
+            window_offset,
+            window_duration,
+            pbar,
+        )
+        chunk_progress.update_to(window_offset + window_duration)
+
+    chunk_progress.finish()
 
 
 def transcribe_wav_file(
@@ -1117,44 +1287,27 @@ def transcribe_wav_file(
     chunk_duration = get_wav_duration(wav_file)
 
     if backend_kind == "openvino":
-        audio_samples = load_wav_samples_for_openvino(wav_file)
-        try:
-            result = run_openvino_transcription(ov_pipeline, audio_samples, beam_size)
-        except Exception as exc:
-            if is_openvino_beam_search_known_issue(exc, beam_size):
-                raise RuntimeError(
-                    format_openvino_beam_search_failure(exc, ov_device_name, beam_size)
-                ) from exc
-            raise
-
-        chunks = getattr(result, "chunks", [])
-        if chunks:
-            for segment in chunks:
-                write_segment(
-                    output_file,
-                    chunk_offset + float(segment.start_ts),
-                    chunk_offset + float(segment.end_ts),
-                    segment.text,
-                )
-        else:
-            write_segment(
-                output_file,
-                chunk_offset,
-                chunk_offset + chunk_duration,
-                getattr(result, "text", result),
-            )
-
-        pbar.update(chunk_duration)
+        transcribe_openvino_wav_file(
+            wav_file,
+            chunk_offset,
+            output_file,
+            pbar,
+            ov_pipeline,
+            ov_device_name,
+            beam_size,
+        )
         return
 
     if backend_kind == "whispercpp-vulkan":
         binary_path, model_path = whispercpp_runtime
+        whispercpp_progress = WhisperCppProgressLogger(pbar, chunk_duration)
         whispercpp_result = run_whispercpp_transcription(
             binary_path,
             model_path,
             wav_file,
             beam_size,
             whispercpp_temp_dir,
+            progress_logger=whispercpp_progress,
         )
 
         if not whispercpp_runtime_state["checked"]:
@@ -1172,19 +1325,24 @@ def transcribe_wav_file(
                 )
             whispercpp_runtime_state["checked"] = True
 
+        echo_segments = whispercpp_result["displayed_segments"] == 0
         for segment in whispercpp_result["segments"]:
             write_segment(
                 output_file,
                 chunk_offset + segment["start"],
                 chunk_offset + segment["end"],
                 segment["text"],
+                pbar=pbar,
+                echo=PRINT_LIVE_TRANSCRIPT and echo_segments,
             )
+            if echo_segments:
+                whispercpp_progress.progress.update_to(segment["end"])
 
-        pbar.update(chunk_duration)
+        whispercpp_progress.finish()
         return
 
-    logger = WhisperProgressLogger(pbar)
     old_stdout = sys.stdout
+    logger = WhisperProgressLogger(pbar, chunk_duration, old_stdout)
     sys.stdout = logger
 
     try:
@@ -1198,9 +1356,7 @@ def transcribe_wav_file(
     finally:
         sys.stdout = old_stdout
 
-    unprocessed = chunk_duration - logger.max_sec_seen
-    if unprocessed > 0:
-        pbar.update(unprocessed)
+    logger.finish()
 
     for segment in result.get("segments", []):
         write_segment(
@@ -1231,9 +1387,10 @@ def transcribe_wav_files(
     with open(output_path, "w", encoding="utf-8") as output_file:
         output_file.write("")
 
-    pbar_format = "{l_bar}{bar}| 进度: {n:.1f}/{total:.1f} 秒音频 [已耗时: {elapsed}, 预计剩余: {remaining}]"
+    pbar_format = "{l_bar}{bar}| 进度: {n:.1f}/{total:.1f} 秒音频 [已耗时: {elapsed}, 预计剩余: {remaining}] {postfix}"
 
     with tqdm(total=total_audio_duration, unit="秒", bar_format=pbar_format) as pbar:
+        update_pbar_multiplier(pbar, 0.0)
         for wav_file, chunk_offset in zip(wav_files, chunk_offsets):
             with open(output_path, "a", encoding="utf-8") as output_file:
                 transcribe_wav_file(
